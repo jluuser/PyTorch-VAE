@@ -1,5 +1,6 @@
 import os
 import torch
+import numpy as np
 from torch import Tensor
 from pathlib import Path
 from typing import List, Optional, Sequence, Union, Any, Callable
@@ -9,7 +10,7 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from torchvision.datasets import CelebA
 import zipfile
-
+from torch.nn.utils.rnn import pad_sequence
 
 # Add your custom dataset class here
 class MyDataset(Dataset):
@@ -178,4 +179,72 @@ class VAEDataset(LightningDataModule):
             shuffle=True,
             pin_memory=self.pin_memory,
         )
-     
+def pad_collate(batch):
+    lengths = [x.size(0) for x in batch]
+    padded_batch = pad_sequence(batch, batch_first=True)
+    mask = torch.tensor([[1]*l + [0]*(padded_batch.size(1) - l) for l in lengths], dtype=torch.bool)
+    return padded_batch, mask
+
+
+class CurveDataset(Dataset):
+    def __init__(self, npy_dir: str, list_file: str, mean_xyz: list, std_xyz: list):
+        with open(list_file, "r") as f:
+            self.file_paths = [os.path.join(npy_dir, line.strip()) for line in f]
+            self.global_mean = np.array(mean_xyz, dtype=np.float32).reshape(1, 3)
+            self.global_std  = np.array(std_xyz,  dtype=np.float32).reshape(1, 3)
+
+    def __len__(self):
+        return len(self.file_paths)
+
+    def __getitem__(self, idx):
+        data = np.load(self.file_paths[idx], allow_pickle=True).item()
+        coords = data["curve_coords"].astype(np.float32)
+        coords = (coords - self.global_mean) / self.global_std
+        ss_one_hot = data["ss_one_hot"].astype(np.float32)
+        full_input = np.concatenate([coords, ss_one_hot], axis=-1)
+        return torch.from_numpy(full_input)
+
+
+class CurveDataModule(LightningDataModule):
+    def __init__(self,
+                 npy_dir: str,
+                 train_list: str,
+                 val_list: str,
+                 mean_xyz: list,
+                 std_xyz:  list,
+                 train_batch_size: int = 256,
+                 val_batch_size: int = 256,
+                 num_workers: int = 4,
+                 pin_memory: bool = False):
+        super().__init__()
+        self.npy_dir = npy_dir
+        self.train_list = os.path.join(npy_dir, train_list)
+        self.val_list = os.path.join(npy_dir, val_list)
+        self.mean_xyz = mean_xyz
+        self.std_xyz = std_xyz
+        self.train_batch_size = train_batch_size
+        self.val_batch_size = val_batch_size
+        self.num_workers = num_workers
+        self.pin_memory = pin_memory
+
+    def setup(self, stage=None):
+        self.train_dataset = CurveDataset(self.npy_dir, self.train_list, mean_xyz=self.mean_xyz, std_xyz=self.std_xyz)
+        self.val_dataset = CurveDataset(self.npy_dir, self.val_list, mean_xyz=self.mean_xyz, std_xyz=self.std_xyz)
+
+    def train_dataloader(self):
+        return DataLoader(self.train_dataset,
+                          batch_size=self.train_batch_size,
+                          shuffle=True,
+                          num_workers=self.num_workers,
+                          pin_memory=self.pin_memory,
+                          collate_fn=pad_collate)
+
+    def val_dataloader(self):
+        return DataLoader(self.val_dataset,
+                          batch_size=self.val_batch_size,
+                          shuffle=False,
+                          num_workers=self.num_workers,
+                          pin_memory=self.pin_memory,
+                          collate_fn=pad_collate)
+
+    

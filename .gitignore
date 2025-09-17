@@ -1,10 +1,31 @@
-
+# Data and logs
 Data/
 logs/
 
+# Experiment outputs
 VanillaVAE/version_0/
 
+# Python cache
 __pycache__/
 .ipynb_checkpoints/
 
+# Jupyter notebooks
 Run.ipynb
+
+# Model checkpoints and weights
+*.ckpt
+*.pt
+*.pth
+checkpoints/
+*_checkpoints/
+
+# Images and visualizations
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.mp4
+curve_img/
+generated_curve_img/
+generated_curves/
+probe_epoch*/
