@@ -1,218 +1,359 @@
+# -*- coding: utf-8 -*-
 #!/usr/bin/env python3
-"""
-Build a VQ codebook via K-means on encoder latents (z_e) from a Stage-A pretrained model.
-
-Usage:
-  python scripts/build_codebook_kmeans.py \
-    --config configs/vq_vae.yaml \
-    --ckpt 902_checkpoints/last.ckpt \
-    --out scripts/kmeans_centroids_256x64.npy \
-    --n-samples 200000 \
-    --batch-size 64
-
-Notes:
-  - Ensure Stage-A training was done with `use_vq: false`.
-  - This script forces `use_vq=false` when constructing the model to extract continuous z_e.
-  - Centroids are L2-normalized before saving, matching the quantizer's cosine metric.
-"""
-
+'''
+python scripts/build_codebook_kmeans.py \
+  --ckpt /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/new_checkpoints5/epochepoch=epoch=039.ckpt \
+  --data_dir /public/home/zhangyangroup/chengshiz/keyuan.zhou/prp-dataset/filtered_curves_npy \
+  --train_list train_list.txt \
+  --out /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/scripts/kmeans_centroids_512x128.npy \
+  --codebook_size 512 \
+  --code_dim 128 \
+  --latent_n_tokens 48 \
+  --batch_size 512 \
+  --num_workers 4 \
+  --amp \
+  --max_samples 400000 \
+  --threads 128 \
+  --devices 4 \
+  --torch_kmeans_max_iter 120 \
+  --torch_kmeans_batch_size 100000
+'''
 import os
 import sys
-import yaml
-import math
 import time
 import argparse
 import numpy as np
-from pathlib import Path
-
 import torch
-import torch.nn as nn
+from torch import nn
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
-# Project-local imports
-# Assumes repository layout similar to: models/, dataset.py, etc.
-from models import vae_models  # mapping name -> class
-from dataset import CurveDataModule
+_SKLEARN_OK = True
+try:
+    from sklearn.cluster import MiniBatchKMeans
+except Exception:
+    _SKLEARN_OK = False
+
+_FAISS_OK = False
+try:
+    import faiss
+    _FAISS_OK = True
+except Exception:
+    _FAISS_OK = False
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from models.vq_vae import VQVAE
+from dataset import CurveDataset, pad_collate
 
 
-def load_config(cfg_path: str) -> dict:
-    with open(cfg_path, "r") as f:
-        return yaml.safe_load(f)
+def strip_prefixes(state_dict, prefixes=("model.", "module.", "net.")):
+    out = {}
+    for k, v in state_dict.items():
+        name = k
+        for p in prefixes:
+            if name.startswith(p):
+                name = name[len(p):]
+                break
+        out[name] = v
+    return out
 
 
-def make_model(cfg: dict, device: torch.device) -> nn.Module:
-    mp = dict(cfg["model_params"])
-    # Force continuous AE mode for feature extraction
-    mp["use_vq"] = False
-    model = vae_models[mp["name"]](**mp)
-    model.to(device)
-    model.eval()
-    return model
-
-
-def load_stage_a_weights(model: nn.Module, ckpt_path: str) -> None:
-    """
-    Loads Lightning checkpoint saved from VAEXperiment into bare model.
-    Tries to strip the 'model.' prefix if present.
-    """
-    ckpt = torch.load(ckpt_path, map_location="cpu")
-    state = ckpt.get("state_dict", ckpt)
-
-    # First try: direct load (in case keys match)
+def set_num_threads(n: int):
+    n = int(max(1, n))
+    os.environ["OMP_NUM_THREADS"] = str(n)
+    os.environ["MKL_NUM_THREADS"] = str(n)
     try:
-        model.load_state_dict(state, strict=False)
-        return
+        torch.set_num_threads(n)
     except Exception:
         pass
 
-    # Second try: strip "model." prefix
-    stripped = {}
-    for k, v in state.items():
-        if k.startswith("model."):
-            stripped[k[len("model."):]] = v
-    missing, unexpected = model.load_state_dict(stripped, strict=False)
-    if len(missing) > 0:
-        print(f"[Warn] Missing keys after load: {len(missing)} (showing first 10): {missing[:10]}")
-    if len(unexpected) > 0:
-        print(f"[Warn] Unexpected keys after load: {len(unexpected)} (showing first 10): {unexpected[:10]}")
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Build VQ codebook from Stage-1 AE token latents.")
+    p.add_argument("--ckpt", type=str, required=True)
+    p.add_argument("--data_dir", type=str, required=True)
+    p.add_argument("--train_list", type=str, required=True)
+    p.add_argument("--out", type=str, required=True)
+
+    p.add_argument("--codebook_size", type=int, default=512)
+    p.add_argument("--code_dim", type=int, default=128)
+    p.add_argument("--latent_n_tokens", type=int, default=48)
+
+    p.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"])
+    p.add_argument("--batch_size", type=int, default=512)
+    p.add_argument("--num_workers", type=int, default=16)
+    p.add_argument("--amp", action="store_true")
+    p.add_argument("--threads", type=int, default=0)
+    p.add_argument("--max_samples", type=int, default=300000)
+
+    p.add_argument("--use_faiss", action="store_true")
+    p.add_argument("--kmeans_batch_size", type=int, default=100000)
+    p.add_argument("--kmeans_max_iter", type=int, default=120)
+    p.add_argument("--kmeans_n_init", type=int, default=1)
+    p.add_argument("--faiss_niter", type=int, default=100)
+    p.add_argument("--faiss_nredo", type=int, default=1)
+
+    p.add_argument("--devices", type=int, default=1)
+    p.add_argument("--torch_kmeans_max_iter", type=int, default=100)
+    p.add_argument("--torch_kmeans_batch_size", type=int, default=100000)
+    return p.parse_args()
+
+
+class LatentExtractor(nn.Module):
+    def __init__(self, model: VQVAE):
+        super().__init__()
+        self.model = model
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+        h_fuse, _, _ = self.model.encode(x, mask=mask)
+        z_tokens = self.model._tokenize_to_codes(h_fuse, mask)
+        return z_tokens
 
 
 @torch.no_grad()
-def collect_latents(model: nn.Module,
-                    datamodule: CurveDataModule,
-                    device: torch.device,
-                    target_tokens: int,
-                    batch_size: int,
-                    num_workers: int) -> np.ndarray:
-    """
-    Streams batches from the train dataloader, encodes to z_e, collects valid tokens by mask,
-    and returns up to `target_tokens` latent vectors as a NumPy array of shape (N, D).
-    """
-    # Use the datamodule's train_dataloader to inherit its collate_fn and settings
-    dl = DataLoader(
-        datamodule.train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True,
-        collate_fn=datamodule.train_dataloader().collate_fn,  # reuse its pad_collate
-    )
-
-    collected = []
-    total = 0
-    t0 = time.time()
-
-    for step, (x, mask) in enumerate(dl, start=1):
-        x = x.to(device, non_blocking=True)
-        mask = mask.to(device, non_blocking=True)
-
-        # Encode to z_e (B, L, D)
-        z_e = model.encode(x, mask=mask)
-
-        # Keep only valid positions
-        # mask: (B, L) bool -> index into z_e
-        valid = mask.reshape(-1)
-        if valid.any():
-            z = z_e.reshape(-1, z_e.size(-1))[valid]  # (M, D)
-            collected.append(z.detach().cpu())
-            total += z.size(0)
-
-        if step % 50 == 0:
-            dt = time.time() - t0
-            print(f"[Info] Batches: {step:04d}, collected tokens: {total}, elapsed: {dt:.1f}s")
-
-        if total >= target_tokens:
-            break
-
-    if len(collected) == 0:
-        raise RuntimeError("No valid tokens collected. Check masks and dataset.")
-
-    X = torch.cat(collected, dim=0)
-    if X.size(0) > target_tokens:
-        X = X[:target_tokens]
-    print(f"[Info] Collected latents: {tuple(X.shape)}")
-    return X.numpy()
-
-
-def run_kmeans(X: np.ndarray, n_clusters: int, batch_size: int = 4096, max_iter: int = 100) -> np.ndarray:
-    """
-    Runs MiniBatchKMeans on X (N, D) and returns L2-normalized centroids (K, D).
-    """
+def collect_token_latents(model: VQVAE,
+                          loader: DataLoader,
+                          device: torch.device,
+                          use_amp: bool,
+                          max_rows: int,
+                          dp_devices: int) -> torch.Tensor:
+    rows = []
+    n_rows = 0
     try:
-        from sklearn.cluster import MiniBatchKMeans
-    except Exception as e:
-        raise RuntimeError("scikit-learn is required: pip install scikit-learn") from e
+        autocast_ctx = torch.amp.autocast(device_type="cuda", enabled=(use_amp and device.type == "cuda"))
+    except Exception:
+        autocast_ctx = torch.cuda.amp.autocast(enabled=(use_amp and device.type == "cuda"))
 
-    print(f"[Info] Running MiniBatchKMeans: K={n_clusters}, N={X.shape[0]}, D={X.shape[1]}")
-    kmeans = MiniBatchKMeans(
-        n_clusters=n_clusters,
+    extractor = LatentExtractor(model)
+    if device.type == "cuda" and int(dp_devices) > 1:
+        extractor = nn.DataParallel(extractor, device_ids=list(range(int(dp_devices)))).to(device)
+    else:
+        extractor = extractor.to(device)
+
+    extractor.eval()
+    with autocast_ctx:
+        for batch in tqdm(loader, desc="Collecting token latents", leave=True):
+            if isinstance(batch, (list, tuple)):
+                x, mask = batch
+            else:
+                x, mask = batch, None
+            x = x.to(device, non_blocking=True)
+            mask = mask.to(device, non_blocking=True) if mask is not None else None
+
+            z_tokens = extractor(x, mask)
+            z_tokens = z_tokens.contiguous().view(-1, z_tokens.size(-1))
+
+            rows.append(z_tokens.cpu())
+            n_rows += z_tokens.size(0)
+            if n_rows >= max_rows:
+                break
+
+    if not rows:
+        raise RuntimeError("No latents collected.")
+    z = torch.cat(rows, dim=0)[:max_rows]
+    return z
+
+
+def kmeans_sklearn(latents_np: np.ndarray,
+                   k: int,
+                   batch_size: int,
+                   max_iter: int,
+                   n_init: int) -> np.ndarray:
+    if not _SKLEARN_OK:
+        raise RuntimeError("scikit-learn not found.")
+    km = MiniBatchKMeans(
+        n_clusters=k,
         batch_size=batch_size,
         max_iter=max_iter,
+        n_init=n_init,
         verbose=1,
-        n_init=3,
+        compute_labels=False,
         init="k-means++",
         reassignment_ratio=0.01,
+        random_state=42,
     )
-    kmeans.fit(X)
-    C = kmeans.cluster_centers_.astype(np.float32)
-    # L2 normalize to match cosine/dot product usage
-    denom = np.linalg.norm(C, axis=1, keepdims=True) + 1e-8
-    C /= denom
-    return C
+    km.fit(latents_np)
+    return km.cluster_centers_.astype(np.float32)
+
+
+def kmeans_faiss(latents_np: np.ndarray, k: int, niter: int, nredo: int) -> np.ndarray:
+    if not _FAISS_OK:
+        raise RuntimeError("FAISS not detected.")
+    d = latents_np.shape[1]
+    km = faiss.Kmeans(d=d, k=k, niter=niter, nredo=nredo, verbose=True, seed=42, gpu=faiss.get_num_gpus() > 0)
+    km.train(latents_np)
+    return km.centroids.astype(np.float32)
+
+
+def _closest_centroid_multi_gpu(x: torch.Tensor, C: torch.Tensor, ngpu: int) -> torch.Tensor:
+    if ngpu <= 1 or x.size(0) < 20000:
+        d2 = (x.pow(2).sum(dim=1, keepdim=True) - 2.0 * (x @ C.t()) + (C.pow(2).sum(dim=1, keepdim=True)).t())
+        return torch.argmin(d2, dim=1)
+
+    chunks = torch.chunk(x, ngpu, dim=0)
+    idx_parts = []
+    C_bcasts = [C.to(f"cuda:{i}") for i in range(ngpu)]
+    for i, part in enumerate(chunks):
+        if part.numel() == 0:
+            continue
+        dev = torch.device(f"cuda:{i}")
+        part = part.to(dev, non_blocking=True)
+        C_i = C_bcasts[i]
+        d2 = (part.pow(2).sum(dim=1, keepdim=True) - 2.0 * (part @ C_i.t()) + (C_i.pow(2).sum(dim=1, keepdim=True)).t())
+        idx_local = torch.argmin(d2, dim=1).to("cuda:0", non_blocking=True)
+        idx_parts.append(idx_local)
+    return torch.cat(idx_parts, dim=0)
+
+
+def kmeans_torch(latents: torch.Tensor,
+                 k: int,
+                 max_iter: int = 100,
+                 batch_size: int = 100000,
+                 devices: int = 1) -> np.ndarray:
+    assert latents.is_cuda, "latents must be on CUDA"
+    N, D = latents.shape
+    K = int(k)
+    ngpu = int(devices)
+
+    perm = torch.randperm(N, device=latents.device)
+    C = latents[perm[:K]].contiguous()
+
+    counts = torch.zeros(K, device="cuda:0", dtype=torch.long)
+    sums = torch.zeros(K, D, device="cuda:0", dtype=latents.dtype)
+
+    for it in range(int(max_iter)):
+        counts.zero_()
+        sums.zero_()
+
+        for start in range(0, N, int(batch_size)):
+            end = min(N, start + int(batch_size))
+            xb = latents[start:end]
+
+            idx = _closest_centroid_multi_gpu(xb, C, ngpu)
+            sums.index_add_(0, idx, xb)
+            one = torch.ones_like(idx, dtype=torch.long, device=idx.device)
+            counts.index_add_(0, idx, one)
+
+        mask = counts > 0
+        C_new = C.clone()
+        C_new[mask] = (sums[mask] / counts[mask].unsqueeze(1).to(sums.dtype))
+        if (~mask).any():
+            need = (~mask).nonzero(as_tuple=True)[0]
+            repl_idx = torch.randint(0, N, (need.numel(),), device="cuda:0")
+            C_new[need] = latents[repl_idx]
+
+        shift = (C_new - C).pow(2).sum().sqrt()
+        C = C_new
+        if float(shift.item()) < 1e-4:
+            break
+
+    return C.detach().float().cpu().numpy()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Build VQ codebook via K-means over encoder latents.")
-    parser.add_argument("--config", type=str, required=True, help="Path to YAML config used for Stage-A model.")
-    parser.add_argument("--ckpt", type=str, required=True, help="Path to Stage-A checkpoint (Lightning .ckpt).")
-    parser.add_argument("--out", type=str, required=True, help="Path to save centroids .npy.")
-    parser.add_argument("--n-samples", type=int, default=200000, help="Number of latent tokens to collect.")
-    parser.add_argument("--batch-size", type=int, default=64, help="Batch size for latent extraction.")
-    parser.add_argument("--workers", type=int, default=4, help="Number of dataloader workers.")
-    parser.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"], help="Device for encoding.")
-    args = parser.parse_args()
+    args = parse_args()
+    if args.threads and args.threads > 0:
+        set_num_threads(args.threads)
+    device = torch.device(args.device if (args.device == "cuda" and torch.cuda.is_available()) else "cpu")
 
-    cfg = load_config(args.config)
+    os.makedirs(os.path.dirname(args.out), exist_ok=True)
+    list_path = args.train_list if os.path.isabs(args.train_list) else os.path.join(args.data_dir, args.train_list)
 
-    # Resolve K from config
-    mp = cfg.get("model_params", {})
-    codebook_size = int(mp.get("codebook_size", 256))
-    model_name = mp.get("name", "VQVAE")
-    print(f"[Info] Model={model_name}, codebook_size={codebook_size}")
-
-    # DataModule
-    dm = CurveDataModule(**cfg["data_params"])
-    dm.setup()
-
-    # Device
-    use_cuda = args.device == "cuda" and torch.cuda.is_available()
-    device = torch.device("cuda" if use_cuda else "cpu")
-    if use_cuda:
-        torch.backends.cudnn.benchmark = True
-
-    # Model
-    model = make_model(cfg, device)
-    load_stage_a_weights(model, args.ckpt)
-    model.eval()
-
-    # Collect latents
-    X = collect_latents(
-        model=model,
-        datamodule=dm,
-        device=device,
-        target_tokens=int(args.n_samples),
-        batch_size=int(args.batch_size),
-        num_workers=int(args.workers),
+    dataset = CurveDataset(npy_dir=args.data_dir, list_path=list_path, train=True)
+    print(f"[Dataset] Found {len(dataset)} curves from {args.data_dir}")
+    loader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
+        collate_fn=pad_collate,
+        drop_last=False,
+        persistent_workers=(args.num_workers > 0),
     )
 
-    # K-means
-    C = run_kmeans(X, n_clusters=codebook_size, batch_size=4096, max_iter=100)
+    model = VQVAE(
+        input_dim=6,
+        hidden_dim=512,
+        num_layers=4,
+        num_heads=8,
+        max_seq_len=350,
+        use_vq=False,
+        codebook_size=args.codebook_size,
+        code_dim=args.code_dim,
+        beta=0.0,
+        label_smoothing=0.0,
+        ss_tv_lambda=0.0,
+        usage_entropy_lambda=0.0,
+        xyz_align_alpha=0.7,
+        dist_lambda=0.0,
+        rigid_aug_prob=0.0,
+        pairwise_sample_k=32,
+        noise_warmup_steps=0,
+        max_noise_std=0.0,
+        reinit_dead_codes=False,
+        reinit_prob=0.0,
+        dead_usage_threshold=0,
+        codebook_init_path="",
+        latent_tokens=int(args.latent_n_tokens),
+        tokenizer_heads=8,
+        tokenizer_layers=2,
+        tokenizer_dropout=0.1,
+        print_init=False,
+    ).to(device)
 
-    # Save
-    out_path = Path(args.out)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    np.save(out_path, C)
-    print(f"[Done] Saved centroids to: {out_path} shape={C.shape}")
+    ckpt = torch.load(args.ckpt, map_location="cpu")
+    if isinstance(ckpt, dict) and "state_dict" in ckpt and isinstance(ckpt["state_dict"], dict):
+        state_dict = strip_prefixes(ckpt["state_dict"])
+    else:
+        state_dict = strip_prefixes(ckpt if isinstance(ckpt, dict) else {})
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    print(f"[Info] Loaded AE checkpoint: {args.ckpt}")
+    print(f"[Info] Missing keys: {len(missing)}, Unexpected keys: {len(unexpected)}")
+
+    t0 = time.time()
+    latents = collect_token_latents(
+        model=model,
+        loader=loader,
+        device=device,
+        use_amp=bool(args.amp),
+        max_rows=int(args.max_samples),
+        dp_devices=int(args.devices),
+    )
+    t1 = time.time()
+    print(f"[Info] Collected {latents.shape[0]} rows of dim {latents.shape[1]} | time={t1 - t0:.2f}s")
+
+    C = None
+    if args.use_faiss and _FAISS_OK:
+        lat_np = latents.numpy()
+        C = kmeans_faiss(
+            lat_np, k=int(args.codebook_size),
+            niter=int(args.faiss_niter), nredo=int(args.faiss_nredo)
+        )
+    elif (not args.use_faiss) and _SKLEARN_OK:
+        lat_np = latents.numpy()
+        C = kmeans_sklearn(
+            latents_np=lat_np,
+            k=int(args.codebook_size),
+            batch_size=int(args.kmeans_batch_size),
+            max_iter=int(args.kmeans_max_iter),
+            n_init=int(args.kmeans_n_init),
+        )
+    else:
+        lat_cuda = latents.to("cuda:0" if torch.cuda.is_available() else device)
+        C = kmeans_torch(
+            lat_cuda,
+            k=int(args.codebook_size),
+            max_iter=int(args.torch_kmeans_max_iter),
+            batch_size=int(args.torch_kmeans_batch_size),
+            devices=int(args.devices),
+        )
+
+    np.save(args.out, C.astype(np.float32))
+    print(f"[Done] Saved codebook centroids to: {args.out}")
 
 
 if __name__ == "__main__":

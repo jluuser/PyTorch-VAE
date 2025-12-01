@@ -1,6 +1,9 @@
 # Data and logs
 Data/
 logs/
+.idea/
+.vscode/
+latent_analysis/
 
 # Experiment outputs
 VanillaVAE/version_0/
