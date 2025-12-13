@@ -1,0 +1,166 @@
+# VQVAE Stage2 Fixed Configuration
+# Soft VQ enabled for stable initial training
+
+model_params:
+  name: "VQVAE-Stage2-Fixed"
+  input_dim: 6
+  hidden_dim: 512
+  num_layers: 4
+  num_heads: 8
+  max_seq_len: 350
+
+  # VQ core parameters
+  use_vq: true
+  codebook_size: 512
+  code_dim: 128
+  beta: 0.01
+
+  # Tokenizer (L -> N)
+  latent_tokens: 48
+  tokenizer_heads: 8
+  tokenizer_layers: 2
+  tokenizer_dropout: 0.0
+
+  # Loss and regularizers
+  label_smoothing: 0.01
+  ss_tv_lambda: 0.004
+  usage_entropy_lambda: 0.0
+  xyz_align_alpha: 0.90
+  dist_lambda: 0.0
+  rigid_aug_prob: 0.0
+  pairwise_sample_k: 32
+
+  # SoftVQ - ENABLED with corrected implementation
+  soft_vq_use: true
+  soft_vq_tau_start: 2.0
+  soft_vq_tau_end: 0.3
+  soft_vq_tau_warm_steps: 8000
+  soft_vq_alpha_warm_steps: 10000
+
+  # EMA and codebook controls
+  ema_decay_start: 0.98
+  ema_decay_end: 0.99
+  ema_decay_warm_steps: 10000
+  ema_update_freeze_steps: 800
+  reinit_dead_codes: true
+  reinit_prob: 0.25
+  dead_usage_threshold: 1
+  #codebook_init_path: "/public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/scripts/kmeans_centroids_512x128.npy"
+
+data_params:
+  npy_dir: "/public/home/zhangyangroup/chengshiz/keyuan.zhou/prp-dataset/filtered_curves_npy/"
+  train_list: "train_list.txt"
+  val_list: "val_list.txt"
+  train_batch_size: 256
+  val_batch_size: 256
+  num_workers: 8
+
+
+  pin_memory: true
+
+exp_params:
+  LR: 0.0001
+  weight_decay: 0.008
+  manual_seed: 1265
+  print_every: 600
+
+  # Base weights (will be overridden by schedules)
+  ss_weight: 1.20
+  bond_length_weight: 0.000
+  bond_angle_weight: 0.000
+  xyz_tv_lambda: 0.002
+  dir_weight: 0.000
+  dih_weight: 0.000
+  rmsd_weight: 1.50
+
+  # Warm start from stage1 checkpoint
+  #warm_start_ckpt: "/public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/ae_new_checkpoints_test/epochepoch=079.ckpt"
+
+  checkpoint_dir: "./vq_s_gradient_ckpt_test11_15_in_tmux_vae"
+  save_every_epochs: 10
+  checkpoint_name_pattern: "epoch{epoch:03d}"
+  lr_scheduler: "none"
+
+  # Training schedules
+  schedules:
+    # Beta: gentle ramp for commitment loss
+    beta:
+      - [0, 0.005]
+      - [15, 0.005]
+      - [30, 0.005]
+      - [50, 0.005]
+      - [70, 0.005]
+      - [80, 0.004]
+      - [90, 0.003]
+    # Learning rate: mild decay
+    LR:
+      - [0, 0.00010]
+      - [20, 0.00007]
+      - [40, 0.00005]
+      - [60, 0.00003]
+      - [70, 0.00002]
+      - [80, 0.00003]
+      - [90, 0.00002]
+    # SS weight
+    ss_weight:
+      - [0, 3.50]
+      - [15, 8.50]
+      - [40, 14.50]
+      - [60, 26.50]
+      - [70, 27.50]
+      - [80, 28.50]
+      - [90, 25.50]
+
+    # RMSD weight: gradually decrease
+    rmsd_weight:
+      - [0, 0.60]
+      - [15, 0.60]
+      - [40, 0.60]
+      - [60, 0.60]
+      - [80, 0.50]
+      - [90, 0.40]
+    # Enable usage entropy later in training
+    usage_entropy_lambda:
+      - [0, 0.000]
+      - [15, 0.0015]
+      - [30, 0.0030]
+
+    # Geometry losses: introduce gradually
+    bond_length_weight:
+      - [0, 0.000]
+      - [25, 0.000]
+      - [45, 0.000]
+
+    bond_angle_weight:
+      - [0, 0.000]
+      - [25, 0.000]
+      - [45, 0.000]
+
+    dir_weight:
+      - [0, 0.000]
+      - [30, 0.000]
+      - [50, 0.000]
+
+    dih_weight:
+      - [0, 0.000]
+      - [30, 0.000]
+      - [50, 0.000]
+
+trainer_params:
+  accelerator: gpu
+  devices: 4
+  strategy: ddp
+  precision: 32
+  max_epochs: 500
+  log_every_n_steps: 10
+  num_sanity_val_steps: 0
+  benchmark: true
+  enable_progress_bar: true
+  gradient_clip_val: 3.0
+  deterministic: false
+  limit_val_batches: 0.25
+  detect_anomaly: false
+
+logging_params:
+  save_dir: "./logs/"
+  name: "VQ-stage2-fixed-softvq-enabled"
