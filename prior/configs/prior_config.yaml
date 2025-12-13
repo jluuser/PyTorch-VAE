@@ -1,0 +1,46 @@
+# Prior over VQ-VAE code indices (fixed N=48)
+
+data:
+  train_manifest: "/public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/prior/out_prior_data/train/manifest.jsonl"
+  val_manifest:   "/public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/prior/out_prior_data/val/manifest.jsonl"
+  pad_token_id: null
+  bos_token_id: null
+  eos_token_id: null
+  max_len: 48                  # latent tokens length N
+  batch_size: 256
+  num_workers: 8
+  bucket_boundaries: []        # disable bucketing for fixed length
+
+vq:
+  codebook_size: 512           # fallback if --vq_yaml is not provided
+
+model:
+  d_model: 512
+  n_layers: 8
+  n_heads: 8
+  ffw_mult: 4
+  dropout: 0.1
+  tie_embeddings: true
+  layer_norm_eps: 1e-5
+
+optim:
+  lr: 1.2e-3
+  betas: [0.9, 0.95]
+  weight_decay: 0.01
+  warmup_updates: 1000
+  max_updates: 20000
+  grad_clip_norm: 1.0
+  label_smoothing: 0.0
+
+runtime:
+  seed: 42
+  log_interval: 100
+  save_interval_updates: 10000
+  eval_interval_updates: 500
+  grad_accum_steps: 2
+  ckpt_dir: "/public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/prior/prior_ckpts/prior_best.pt"
+  device: "cuda"
+  dtype: "float32"
+  amp: true
+  periodic_save_every: 0
+  keep_last_periodic: 2

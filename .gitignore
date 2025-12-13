@@ -4,6 +4,8 @@ logs/
 .idea/
 .vscode/
 latent_analysis/
+pdb_length_analysis/
+prior/out_prior_data/
 
 # Experiment outputs
 VanillaVAE/version_0/
@@ -19,6 +21,10 @@ Run.ipynb
 *.ckpt
 *.pt
 *.pth
+*.npy
+*.json
+*.jsonl
+*.tar.gz
 checkpoints/
 *_checkpoints/
 

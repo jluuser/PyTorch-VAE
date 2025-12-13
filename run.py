@@ -17,8 +17,8 @@ Usage examples:
   # Resume from a previous full checkpoint (optimizer, schedulers, etc.)
   # When --resume_ckpt is provided, warm-start and codebook init are skipped.
   python run.py \
-      --config configs/stage2_vq_resume_110.yaml \
-      --resume_ckpt /public/home/xxx/PyTorch-VAE/vq_new_checkpoints4/epochepoch=099.ckpt
+      --config configs/stage2_vq.yaml \
+      --resume_ckpt /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/checkpoints/vq_s_gradient_ckpt_test11_15/epochepoch=549.ckpt
 """
 
 import os
