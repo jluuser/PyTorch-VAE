@@ -1,6 +1,6 @@
 import numpy as np
 
-npy_path = "/public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/reconstructions/recon_epoch_49_0.npy"
+npy_path = "/public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/prior/prior_recons_300/sample_prior_0000_recon.npy"
 txt_path = "/public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/recon_epoch_49_0_full_dump.txt"
 
 data = np.load(npy_path, allow_pickle=True)

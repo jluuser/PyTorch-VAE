@@ -6,10 +6,10 @@ model_params:
   num_heads: 8
   max_seq_len: 350
   use_vq: false
-  codebook_size: 512
-  code_dim: 128
+  codebook_size: 1024
+  code_dim: 512
   beta: 0.0
-  latent_tokens: 48
+  latent_tokens: 64
   tokenizer_heads: 8
   tokenizer_layers: 2
   tokenizer_dropout: 0.1
@@ -20,8 +20,8 @@ model_params:
   dist_lambda: 0.0
   rigid_aug_prob: 0.0
   pairwise_sample_k: 32
-  noise_warmup_steps: 2000
-  max_noise_std: 0.005
+  noise_warmup_steps: 0
+  max_noise_std: 0.00
   reinit_dead_codes: false
   reinit_prob: 0.0
   dead_usage_threshold: 0
@@ -31,13 +31,13 @@ data_params:
   npy_dir: "/public/home/zhangyangroup/chengshiz/keyuan.zhou/prp-dataset/filtered_curves_npy/"
   train_list: "train_list.txt"
   val_list: "val_list.txt"
-  train_batch_size: 256
-  val_batch_size: 256
-  num_workers: 8
+  train_batch_size: 384
+  val_batch_size: 384
+  num_workers: 16
   pin_memory: true
 
 exp_params:
-  LR: 0.0004
+  LR: 0.004
   weight_decay: 0.01
   manual_seed: 1265
   ss_weight: 0.20
@@ -49,18 +49,20 @@ exp_params:
   rmsd_weight: 1.0
   print_every: 600
   schedules:
-    bond_length_weight: [[0, 0.000], [5, 0.0015], [12, 0.003], [25, 0.004]]
-    bond_angle_weight: [[0, 0.000], [5, 0.003], [12, 0.003], [25, 0.004]]
-    dir_weight: [[0, 0.000], [15, 0.003], [30, 0.006]]
-    dih_weight: [[0, 0.000], [18, 0.003], [38, 0.006]]
-    xyz_tv_lambda: [[0, 0.006], [10, 0.010], [40, 0.020]]
-    ss_weight: [[0, 0.60], [8, 0.85], [35, 1.00]]
+    bond_length_weight: [[0, 0.000], [5, 0.000], [12, 0.000], [25, 0.000]]
+    bond_angle_weight: [[0, 0.000], [5, 0.000], [12, 0.000], [25, 0.000]]
+    dir_weight: [[0, 0.000], [3, 0.000], [30, 0.000]]
+    dih_weight: [[0, 0.000], [18, 0.000], [38, 0.000]]
+    xyz_tv_lambda: [[0, 0.006], [10, 0.010], [20, 0.020]]
+    ss_weight: [[0, 0.60], [8, 0.85]]
     rigid_aug_prob: [[0, 0.00]]
-    xyz_align_alpha: [[0, 1.00], [10, 0.85], [30, 0.70]]
+    xyz_align_alpha: [[0, 1.00], [10, 0.95]]
   lr_scheduler: "onecycle"
   onecycle_pct_start: 0.12
   onecycle_div_factor: 20.0
   onecycle_final_div: 5000.0
+
+  
 
 trainer_params:
   accelerator: gpu
@@ -78,4 +80,4 @@ trainer_params:
 
 logging_params:
   save_dir: "./logs/"
-  name: "AE-stage1-tokenN48"
+  name: "AE-stage1-1024512"

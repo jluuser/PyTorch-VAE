@@ -563,50 +563,42 @@ class VQVAE(nn.Module):
     
         ss_onehot = x[..., 3:]
         h_ss = self.ss_input_proj(ss_onehot)
-        h_ss = h_ss + self.pos_enc[:, :L, :]  # 添加位置编码
+        h_ss = h_ss + self.pos_enc[:, :L, :]  
         h_enc_ss = self.ss_encoder(h_ss, src_key_padding_mask=(~mask) if mask is not None else None)
         s = self.ln_ss(h_enc_ss)
-        # 添加梯度监控（简化版）
         if self.training and self._grad_monitor_enabled and hasattr(self, '_create_grad_hook_func'):
             create_hook = self._create_grad_hook_func
             self._grad_hooks.append(g.register_hook(create_hook("Geo-Branch")))
             self._grad_hooks.append(s.register_hook(create_hook("SS-Branch")))
         h_fuse_tokens = self.fuse_mlp(torch.cat([g, s], dim=-1))
-        # 监控融合层输出
         if self.training and self._grad_monitor_enabled and hasattr(self, '_create_grad_hook_func'):
             self._grad_hooks.append(h_fuse_tokens.register_hook(create_hook("Fusion-Output")))
         return h_fuse_tokens, h_enc_geo, h_enc_ss
 
     def enable_grad_monitor(self, enabled: bool = True):
-        """启用或禁用梯度监控"""
         self._grad_monitor_enabled = enabled
-        
-        # 移除旧的hook
         for hook in self._grad_hooks:
             hook.remove()
         self._grad_hooks.clear()
         
         if enabled:
             print(f"[Grad Monitor] Enabled")
-            # 在启用时创建hook
             def create_grad_hook(name):
                 def hook(grad):
                     if torch.isnan(grad).any() or torch.isinf(grad).any():
                         print(f"[GRAD-ERROR] {name}: NaN or Inf detected!")
                     else:
                         grad_norm = grad.norm().item()
-                        if grad_norm > 1e-6:  # 只打印有意义的梯度
+                        if grad_norm > 1e-6:  
                             print(f"[GRAD] {name}: norm={grad_norm:.6f}, mean={grad.mean().item():.6f}, std={grad.std().item():.6f}")
                 return hook
             
-            # 为关键层注册hook（在forward中动态获取tensor）
             self._create_grad_hook_func = create_grad_hook
         else:
             print(f"[Grad Monitor] Disabled")
             self._create_grad_hook_func = None
             
     def print_grad_summary(self):
-        """打印模型各部分的梯度统计"""
         if not self.training:
             print("[Grad Summary] Model is in eval mode, no gradients")
             return
@@ -766,7 +758,7 @@ class VQVAE(nn.Module):
                 z_for_decode = z_e_tokens + (z_q_mix - z_e_tokens).detach()  
                 z_q_raw = z_q_hard
                 
-                do_ema_update = do_ema_update and (alpha >= 0.25)
+                do_ema_update = do_ema_update and (alpha >= 0)
                 
                 if self.training and do_ema_update:
                     self.quantizer._ema_update(flat_ze.detach(), indices.detach())
@@ -847,6 +839,7 @@ class VQVAE(nn.Module):
         with torch.no_grad():
             a_c, a_mu = VQVAE._center(a_xyz, mask)
             b_c, b_mu = VQVAE._center(b_xyz, mask)
+            # H = A^T @ B
             if mask is None:
                 H = torch.einsum("bli,blj->bij", a_c, b_c)
             else:
@@ -854,11 +847,18 @@ class VQVAE(nn.Module):
                 H = torch.einsum("bli,blj->bij", a_c * m, b_c)
             try:
                 U, S, Vh = torch.linalg.svd(H)
-                V = Vh.transpose(-2, -1)
-                det = torch.det(V @ U.transpose(-2, -1))
+                
+                # Fix 1: Vh returned by torch.linalg.svd is already V^T
+                # Fix 2: Correct rotation formula R = U @ D @ V^T
+                
+                # Check determinant to handle reflection vs rotation
+                # Note: det(R) = det(U) * det(V^T)
+                det = torch.det(U @ Vh)
                 D = torch.eye(3, device=device).unsqueeze(0).repeat(B, 1, 1)
                 D[:, -1, -1] = (det >= 0).to(D.dtype) * 2.0 - 1.0
-                R = V @ D @ U.transpose(-2, -1)
+
+                # Correct formula: R = U D V^T
+                R = U @ D @ Vh  
             except Exception:
                 R = torch.eye(3, device=device).unsqueeze(0).repeat(B, 1, 1)
             t = b_mu - torch.einsum("bli,bij->blj", a_mu, R)
@@ -1031,8 +1031,9 @@ class VQVAE(nn.Module):
         raw_mse_per_sample = self._mse_per_sample(re_xyz, gt_xyz, mask)
         loss_xyz_raw = raw_mse_per_sample.mean()
         
+        aln_mse_per_sample = raw_mse_per_sample
+        best_mse_per_sample = raw_mse_per_sample
         loss_xyz_aligned = loss_xyz_raw
-        aln_mse_per_sample = raw_mse_per_sample.clone()
         re_aln = re_xyz
         
         try:
@@ -1255,6 +1256,8 @@ class VQVAE(nn.Module):
         out = {
             "loss": total_loss,
             "Reconstruction_Loss_XYZ": loss_xyz.detach(),
+            "XYZ_MSE_Raw": loss_xyz_raw.detach(),
+            "XYZ_MSE_Aligned": aln_mse_per_sample.mean().detach(),
             "Reconstruction_Loss_SS": loss_ss.detach(),
             "SS_Accuracy": ss_acc.detach(),
             "VQ_Loss": vq_loss.detach(),

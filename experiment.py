@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 import os
 import yaml
-import math
 import torch
 import torch.nn.functional as F
 import pytorch_lightning as pl
@@ -39,10 +38,17 @@ def _resolve_path(base_dir: str, p: str) -> str:
     return p if os.path.isabs(p) else os.path.join(base_dir, p)
 
 
+def _normalize_path(p: Optional[str]) -> Optional[str]:
+    if p is None:
+        return None
+    if isinstance(p, str) and p.strip() == "":
+        return None
+    return p
+
+
 class VQVAEExperiment(pl.LightningModule):
     def __init__(self, model_params: dict, exp_params: dict, data_params: dict):
         super().__init__()
-        # core hparams
         self.LR = float(exp_params.get("LR", 1e-3))
         self.weight_decay = float(exp_params.get("weight_decay", 0.0))
         self.manual_seed = int(exp_params.get("manual_seed", 42))
@@ -53,20 +59,26 @@ class VQVAEExperiment(pl.LightningModule):
             "model_name": model_params.get("name", "VQVAE"),
         })
 
-        # model
+        # Model
         self.model = VQVAE(**model_params)
         self.exp_params = exp_params
         self.data_params = data_params
 
-        # optional warm-start (stage-2 using stage-1 weights)
-        self._warm_start_ckpt: Optional[str] = exp_params.get("warm_start_ckpt", None)
-        if isinstance(self._warm_start_ckpt, str) and self._warm_start_ckpt.strip() == "":
-            self._warm_start_ckpt = None
+        # Optional warm-start ckpt (stage-2 using stage-1 weights)
+        self._warm_start_ckpt: Optional[str] = _normalize_path(exp_params.get("warm_start_ckpt", None))
 
-        # schedules (only keys we actually use)
+        # Optional codebook init path (kmeans centroids)
+        # Priority: exp_params.init_codebook_path > model_params.codebook_init_path
+        self._init_codebook_path: Optional[str] = _normalize_path(
+            exp_params.get("init_codebook_path", None)
+        )
+        if self._init_codebook_path is None:
+            self._init_codebook_path = _normalize_path(model_params.get("codebook_init_path", None))
+
+        # Schedules
         self.schedules: Dict[str, List[List[float]]] = exp_params.get("schedules", {}) or {}
 
-        # loss/weights state (only minimal keys used by simplified model)
+        # Current weights
         self.current_weights: Dict[str, float] = {
             "ss_weight": float(exp_params.get("ss_weight", 1.0)),
             "bond_length_weight": float(exp_params.get("bond_length_weight", 0.0)),
@@ -78,7 +90,7 @@ class VQVAEExperiment(pl.LightningModule):
             "label_smoothing": float(model_params.get("label_smoothing", 0.0)),
             "usage_entropy_lambda": float(model_params.get("usage_entropy_lambda", 0.0)),
             "beta": float(model_params.get("beta", 0.25)),
-            # optional geometry regularizers (log if present)
+            # Optional geometry regularizers
             "pdm_weight": float(exp_params.get("pdm_weight", 0.0)),
             "win_kabsch_weight": float(exp_params.get("win_kabsch_weight", 0.0)),
             "kappa_weight": float(exp_params.get("kappa_weight", 0.0)),
@@ -92,18 +104,18 @@ class VQVAEExperiment(pl.LightningModule):
             "lr_max_offsets": float(exp_params.get("lr_max_offsets", 8)),
         }
 
-        # simple example shape for Lightning summary
         self.example_input_array = (torch.zeros(1, 64, 6), torch.ones(1, 64, dtype=torch.bool))
 
         torch.manual_seed(self.manual_seed)
         self.train_dataset = None
         self.val_dataset = None
 
-        # epoch accumulators for a compact end-of-epoch print
         self._ep_sum = {"loss": 0.0, "xyz": 0.0, "ss_loss": 0.0, "vq": 0.0, "rmsd_aln": 0.0, "rmsd_raw": 0.0}
         self._ep_n = 0
 
-    # data
+    # -------------------------
+    # Data
+    # -------------------------
     def setup(self, stage: Optional[str] = None):
         npy_dir = self.data_params["npy_dir"]
         train_list = _resolve_path(npy_dir, self.data_params["train_list"])
@@ -136,27 +148,32 @@ class VQVAEExperiment(pl.LightningModule):
             drop_last=False,
             persistent_workers=(int(self.data_params.get("num_workers", 8)) > 0),
         )
+
     def on_validation_epoch_start(self):
-        if hasattr(self.model.quantizer, 'reset_epoch_stats'):
+        if hasattr(self.model, "quantizer") and hasattr(self.model.quantizer, "reset_epoch_stats"):
             self.model.quantizer.reset_epoch_stats()
-    
+
     def on_validation_epoch_end(self):
-        if hasattr(self.model.quantizer, 'get_epoch_stats'):
+        if hasattr(self.model, "quantizer") and hasattr(self.model.quantizer, "get_epoch_stats"):
             stats = self.model.quantizer.get_epoch_stats()
             if self.global_rank == 0:
                 print(f"[Val Stats] PPL: {stats.get('perplexity', 0):.2f}, "
                       f"Dead Ratio: {stats.get('dead_ratio', 0):.3f}")
-    # optim
+
+    # -------------------------
+    # Optim
+    # -------------------------
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.LR, weight_decay=self.weight_decay)
-    
+
+        # If LR is scheduled manually by our epoch schedule, do not register a scheduler here.
         if self.schedules and "LR" in self.schedules:
             return [optimizer]
-    
+
         sched_name = str(self.exp_params.get("lr_scheduler", "cosine")).lower()
         if sched_name == "none":
             return optimizer
-    
+
         if sched_name == "onecycle":
             steps_per_epoch = max(1, len(self.train_dataloader()))
             scheduler = torch.optim.lr_scheduler.OneCycleLR(
@@ -170,62 +187,137 @@ class VQVAEExperiment(pl.LightningModule):
                 final_div_factor=float(self.exp_params.get("onecycle_final_div", 1500.0)),
             )
             return {"optimizer": optimizer, "lr_scheduler": {"scheduler": scheduler, "interval": "step"}}
-    
+
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=int(self.trainer.max_epochs), eta_min=self.LR * 1e-6
         )
         return {"optimizer": optimizer, "lr_scheduler": scheduler}
 
+    # -------------------------
+    # Warm-start helpers
+    # -------------------------
+    @staticmethod
+    def _strip_model_prefix(state: Dict[str, torch.Tensor], prefix: str = "model.") -> Dict[str, torch.Tensor]:
+        out: Dict[str, torch.Tensor] = {}
+        for k, v in state.items():
+            if k.startswith(prefix):
+                out[k[len(prefix):]] = v
+            else:
+                out[k] = v
+        return out
 
-    # lifecycle
-    def on_fit_start(self):
-        # resume path from Trainer takes precedence
-        if getattr(self.trainer, "ckpt_path", None):
+    @staticmethod
+    def _filter_state_dict_for_warmstart(
+        candidate: Dict[str, torch.Tensor],
+        model_state: Dict[str, torch.Tensor],
+        drop_prefixes: Tuple[str, ...] = ("quantizer.",),
+        require_shape_match: bool = True,
+    ) -> Tuple[Dict[str, torch.Tensor], List[str], List[str]]:
+        kept: Dict[str, torch.Tensor] = {}
+        skipped_prefix: List[str] = []
+        skipped_shape: List[str] = []
+
+        for k, v in candidate.items():
+            if any(k.startswith(dp) for dp in drop_prefixes):
+                skipped_prefix.append(k)
+                continue
+            if k not in model_state:
+                continue
+            if require_shape_match and tuple(v.shape) != tuple(model_state[k].shape):
+                skipped_shape.append(k)
+                continue
+            kept[k] = v
+        return kept, skipped_prefix, skipped_shape
+
+    def _maybe_init_codebook(self):
+        # Only meaningful when VQ is enabled and a codebook path is provided.
+        if not getattr(self.model, "use_vq", False):
+            return
+        if self._init_codebook_path is None:
+            return
+        if not os.path.isfile(self._init_codebook_path):
             if self.global_rank == 0:
-                try:
-                    lr_now = self.trainer.optimizers[0].param_groups[0]["lr"]
-                except Exception:
-                    lr_now = None
-                print(f"[Resume] ckpt detected, skip warm-start. resume_epoch={int(self.current_epoch)} lr={lr_now}")
+                print(f"[CodebookInit] Path not found: {self._init_codebook_path}")
             return
 
-        # optional warm-start
+        try:
+            import numpy as np
+            C = np.load(self._init_codebook_path).astype("float32")
+            C = torch.from_numpy(C)
+            self.model.init_codebook_from_centroids(C)
+            if self.global_rank == 0:
+                print(f"[CodebookInit] Loaded centroids from: {self._init_codebook_path} shape={tuple(C.shape)}")
+        except Exception as e:
+            if self.global_rank == 0:
+                print(f"[CodebookInit] Failed to init codebook: {e}")
+
+    # -------------------------
+    # Lifecycle
+    # -------------------------
+    def on_fit_start(self):
+        # If trainer.fit(..., ckpt_path=...) is used, this is a true resume.
+        # In that case, do NOT warm-start or re-init codebook.
+        resume_ckpt = getattr(self.trainer, "ckpt_path", None)
+        if isinstance(resume_ckpt, str) and resume_ckpt.strip() == "":
+            resume_ckpt = None
+        if resume_ckpt is not None:
+            if self.global_rank == 0:
+                lr_now = None
+                try:
+                    if self.trainer.optimizers:
+                        lr_now = self.trainer.optimizers[0].param_groups[0]["lr"]
+                except Exception:
+                    pass
+                print(f"[Resume] ckpt_path detected, skip warm-start/codebook-init. resume_epoch={int(self.current_epoch)} lr={lr_now}")
+            return
+
+        # Warm-start: load weights from a previous checkpoint, but DO NOT load quantizer.* states.
         if self._warm_start_ckpt and os.path.isfile(self._warm_start_ckpt):
             if self.global_rank == 0:
                 print(f"[WarmStart] Loading model weights from: {self._warm_start_ckpt}")
+
             try:
                 ckpt = torch.load(self._warm_start_ckpt, map_location="cpu")
                 state = ckpt.get("state_dict", ckpt)
-                new_state = {}
-                for k, v in state.items():
-                    if k.startswith("model."):
-                        new_state[k[len("model."):]] = v
-                    else:
-                        new_state[k] = v
-                missing, unexpected = self.model.load_state_dict(new_state, strict=False)
+                state = self._strip_model_prefix(state, prefix="model.")
+
+                model_state = self.model.state_dict()
+                filtered, skipped_prefix, skipped_shape = self._filter_state_dict_for_warmstart(
+                    candidate=state,
+                    model_state=model_state,
+                    drop_prefixes=("quantizer.",),   # critical: prevent codebook overwrite
+                    require_shape_match=True,
+                )
+
+                missing, unexpected = self.model.load_state_dict(filtered, strict=False)
+
                 if self.global_rank == 0:
-                    print(f"[WarmStart] loaded with missing={len(missing)}, unexpected={len(unexpected)}")
+                    print(f"[WarmStart] loaded kept={len(filtered)} missing={len(missing)} unexpected={len(unexpected)} "
+                          f"skipped_prefix={len(skipped_prefix)} skipped_shape={len(skipped_shape)}")
+                    if len(skipped_shape) > 0:
+                        print(f"[WarmStart] skipped_shape_examples: {skipped_shape[:10]}")
             except Exception as e:
                 if self.global_rank == 0:
                     print(f"[WarmStart] Failed to load: {e}")
+
+        # Always apply codebook init AFTER warm-start (so it cannot be overwritten).
+        self._maybe_init_codebook()
 
     def on_train_epoch_start(self):
         epoch = int(self.current_epoch)
         new_vals = interpolate_schedule(self.schedules, epoch) if self.schedules else {}
 
-        # apply schedules to current weights (only known keys)
         for k, v in (new_vals or {}).items():
             if k in self.current_weights:
                 self.current_weights[k] = float(v)
 
-        # cast some window-like params to int
         for _k in ["pdm_window", "win_kabsch_size", "win_kabsch_stride", "lr_min_sep", "lr_stride", "lr_max_offsets"]:
             self.current_weights[_k] = int(round(float(self.current_weights.get(_k, 0))))
 
-        # write a few directly into model if needed
         self.model.label_smoothing = self.current_weights["label_smoothing"]
         self.model.usage_entropy_lambda = self.current_weights["usage_entropy_lambda"]
-        self.model.quantizer.reset_epoch_stats()
+        if hasattr(self.model, "quantizer") and hasattr(self.model.quantizer, "reset_epoch_stats"):
+            self.model.quantizer.reset_epoch_stats()
 
         if self.global_rank == 0:
             kw = self.current_weights
@@ -235,17 +327,21 @@ class VQVAEExperiment(pl.LightningModule):
 
         self._ep_sum = {"loss": 0.0, "xyz": 0.0, "ss_loss": 0.0, "vq": 0.0, "rmsd_aln": 0.0, "rmsd_raw": 0.0}
         self._ep_n = 0
+
         if "beta" in self.current_weights:
             self.model.beta = float(self.current_weights["beta"])
             if hasattr(self.model, "quantizer"):
                 self.model.quantizer.beta = float(self.model.beta)
-        
+
         if "LR" in new_vals:
             new_lr = float(new_vals["LR"])
             if self.trainer and self.trainer.optimizers:
                 for param_group in self.trainer.optimizers[0].param_groups:
-                    param_group['lr'] = new_lr
-    # core path
+                    param_group["lr"] = new_lr
+
+    # -------------------------
+    # Core
+    # -------------------------
     def forward(self, x, mask):
         return self.model(x, mask)
 
@@ -253,7 +349,6 @@ class VQVAEExperiment(pl.LightningModule):
         x, mask = batch
         recons, target, vq_pack, mask_out = self.forward(x, mask)
 
-        # loss dict from model
         loss_dict = self.model.loss_function(
             recons, target, vq_pack, mask_out,
             ss_weight=self.current_weights["ss_weight"],
@@ -276,7 +371,7 @@ class VQVAEExperiment(pl.LightningModule):
             lr_max_offsets=self.current_weights["lr_max_offsets"],
         )
 
-        # optional quick latent diagnostics (cheap)
+        # Optional quick latent diagnostics (cheap)
         try:
             zq_raw, ze_raw, _, _, _ = vq_pack
             if mask_out is not None and ze_raw.size(1) == mask_out.size(1):
@@ -301,7 +396,6 @@ class VQVAEExperiment(pl.LightningModule):
             zq_norm = torch.tensor(0.0, device=device)
             cos_ze_zq = torch.tensor(0.0, device=device)
 
-        # logging
         on_step = (stage == "train")
         on_epoch = True
         pb = False
@@ -309,7 +403,14 @@ class VQVAEExperiment(pl.LightningModule):
 
         self.log(f"{stage}/loss_total", loss_dict["loss"].float(), on_step=on_step, on_epoch=on_epoch, prog_bar=pb, sync_dist=sync)
         self.log(f"{stage}/loss_xyz", loss_dict["Reconstruction_Loss_XYZ"].float(), on_step=on_step, on_epoch=on_epoch, prog_bar=pb, sync_dist=sync)
+
+        if "XYZ_MSE_Raw" in loss_dict:
+            self.log(f"{stage}/xyz_mse_raw", loss_dict["XYZ_MSE_Raw"].float(), on_step=on_step, on_epoch=True, prog_bar=False, sync_dist=sync)
+        if "XYZ_MSE_Aligned" in loss_dict:
+            self.log(f"{stage}/xyz_mse_aln", loss_dict["XYZ_MSE_Aligned"].float(), on_step=on_step, on_epoch=True, prog_bar=False, sync_dist=sync)
+
         self.log(f"{stage}/vq_loss", loss_dict["VQ_Loss"].float(), on_step=on_step, on_epoch=on_epoch, prog_bar=pb, sync_dist=sync)
+
         if "VQ_Perplexity" in loss_dict:
             self.log(f"{stage}/perplexity", loss_dict["VQ_Perplexity"].float(), on_step=on_step, on_epoch=on_epoch, prog_bar=pb, sync_dist=sync)
         if "VQ_DeadRatio" in loss_dict:
@@ -317,12 +418,10 @@ class VQVAEExperiment(pl.LightningModule):
         if "SS_Accuracy" in loss_dict:
             self.log(f"{stage}/ss_acc", loss_dict["SS_Accuracy"].float(), on_step=on_step, on_epoch=on_epoch, prog_bar=pb, sync_dist=sync)
 
-        # lr on step
         if stage == "train" and self.trainer and self.trainer.optimizers:
             lr = self.trainer.optimizers[0].param_groups[0]["lr"]
             self.log(f"{stage}/lr", torch.tensor(lr, device=loss_dict["loss"].device).float(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=False)
 
-        # optional long-tail metrics only on epoch
         for k in [
             "Reconstruction_Loss_SS", "Geom_Loss",
             "Geom_BondLength_Loss", "Geom_BondAngle_Loss", "Geom_Direction_Loss", "Geom_Dihedral_Loss",
@@ -332,9 +431,8 @@ class VQVAEExperiment(pl.LightningModule):
         ]:
             if k in loss_dict:
                 on_step_k = (stage == "train") and (k in ["RMSD_Raw", "RMSD_Aligned"])
-                self.log(f"{stage}/{k}", loss_dict[k].float(),
-                         on_step=on_step_k, on_epoch=True, prog_bar=False, sync_dist=sync)
-        # for compact epoch-end print
+                self.log(f"{stage}/{k}", loss_dict[k].float(), on_step=on_step_k, on_epoch=True, prog_bar=False, sync_dist=sync)
+
         if stage == "train":
             self._ep_sum["loss"] += float(loss_dict["loss"].detach().item())
             self._ep_sum["xyz"] += float(loss_dict["Reconstruction_Loss_XYZ"].detach().item())
@@ -346,7 +444,9 @@ class VQVAEExperiment(pl.LightningModule):
 
         return loss_dict["loss"]
 
-    # hooks
+    # -------------------------
+    # Lightning hooks
+    # -------------------------
     def training_step(self, batch, batch_idx):
         loss = self._compute_and_log(batch, stage="train")
         N = int(self.exp_params.get("print_every", 0))
@@ -356,6 +456,8 @@ class VQVAEExperiment(pl.LightningModule):
                 f"step={batch_idx:05d} | "
                 f"loss={float(md.get('train/loss_total', 0.0)):.3f} | "
                 f"xyz={float(md.get('train/loss_xyz', 0.0)):.3f} | "
+                f"xyz_raw={float(md.get('train/xyz_mse_raw', 0.0)):.3f} | "
+                f"xyz_aln={float(md.get('train/xyz_mse_aln', 0.0)):.3f} | "
                 f"vq={float(md.get('train/vq_loss', 0.0)):.3f} | "
                 f"ppl={float(md.get('train/perplexity', 0.0)):.3f} | "
                 f"dead={float(md.get('train/dead_ratio', 0.0)):.3f} | "
@@ -379,20 +481,23 @@ class VQVAEExperiment(pl.LightningModule):
             mean_xyz = self._ep_sum["xyz"] / self._ep_n
             mean_ss_loss = self._ep_sum["ss_loss"] / self._ep_n
             mean_vq = self._ep_sum["vq"] / self._ep_n
-            mean_ra   = self._ep_sum["rmsd_aln"] / self._ep_n
-            mean_rr   = self._ep_sum["rmsd_raw"] / self._ep_n
+            mean_ra = self._ep_sum["rmsd_aln"] / self._ep_n
+            mean_rr = self._ep_sum["rmsd_raw"] / self._ep_n
+
             lr = 0.0
             try:
                 if self.trainer and self.trainer.optimizers:
                     lr = float(self.trainer.optimizers[0].param_groups[0]["lr"])
             except Exception:
                 pass
+
             print(
                 f"[Epoch {int(self.current_epoch)}] "
                 f"loss={mean_loss:.4f} xyz={mean_xyz:.4f} ss_loss={mean_ss_loss:.4f} "
                 f"rmsd_aln={mean_ra:.4f}Å rmsd_raw={mean_rr:.4f}Å "
                 f"vq={mean_vq:.4f} lr={lr:.6f}"
             )
+
 
 def build_experiment_from_yaml(yaml_path: str) -> Tuple[pl.LightningModule, dict]:
     with open(yaml_path, "r") as f:
@@ -460,7 +565,7 @@ if __name__ == "__main__":
         deterministic=trainer_params.get("deterministic", False),
         callbacks=[ckpt_cb],
         default_root_dir=out_dir,
-        logger=False,  # console only
+        logger=False,
     )
 
     trainer.fit(exp, ckpt_path=args.ckpt_path)

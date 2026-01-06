@@ -2,15 +2,15 @@
 #!/usr/bin/env python3
 '''
 python scripts/build_codebook_kmeans.py \
-  --ckpt /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/new_checkpoints5/epochepoch=epoch=039.ckpt \
+  --ckpt /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/checkpoints/ae_1024_512/last.ckpt \
   --data_dir /public/home/zhangyangroup/chengshiz/keyuan.zhou/prp-dataset/filtered_curves_npy \
   --train_list train_list.txt \
-  --out /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/scripts/kmeans_centroids_512x128.npy \
-  --codebook_size 512 \
-  --code_dim 128 \
-  --latent_n_tokens 48 \
+  --out /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/scripts/kmeans_centroids_1024x512.npy \
+  --codebook_size 1024 \
+  --code_dim 512 \
+  --latent_n_tokens 64 \
   --batch_size 512 \
-  --num_workers 4 \
+  --num_workers 16 \
   --amp \
   --max_samples 400000 \
   --threads 128 \

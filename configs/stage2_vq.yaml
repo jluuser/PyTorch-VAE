@@ -1,154 +1,241 @@
-# VQVAE Stage2 Fixed Configuration
-# Soft VQ enabled for stable initial training
+# VQVAE Stage2 (from-scratch) config
+# - code_dim=512
+# - Physics constraints enabled early (start ~epoch 50) with ramps
+# - ss_weight: small -> large -> small
+# - rmsd_weight: large -> small -> large
 
 model_params:
-  name: "VQVAE-Stage2-Fixed"
+  name: "VQVAE-Stage2-FromScratch-Token64-K1024-D512"
   input_dim: 6
   hidden_dim: 512
   num_layers: 4
   num_heads: 8
   max_seq_len: 350
 
-  # VQ core parameters
+  # VQ core
   use_vq: true
-  codebook_size: 512
-  code_dim: 128
-  beta: 0.01
+  codebook_size: 1024
+  code_dim: 512
+  beta: 0.00
 
   # Tokenizer (L -> N)
-  latent_tokens: 48
+  latent_tokens: 64
   tokenizer_heads: 8
   tokenizer_layers: 2
-  tokenizer_dropout: 0.0
+  tokenizer_dropout: 0.10
 
-  # Loss and regularizers
+  # Loss / regularizers
   label_smoothing: 0.01
-  ss_tv_lambda: 0.004
+  ss_tv_lambda: 0.002
   usage_entropy_lambda: 0.0
-  xyz_align_alpha: 0.90
+  xyz_align_alpha: 0.95
   dist_lambda: 0.0
   rigid_aug_prob: 0.0
   pairwise_sample_k: 32
 
-  # SoftVQ - ENABLED with corrected implementation
-  soft_vq_use: true
+  # Soft VQ
+  soft_vq_use: false
   soft_vq_tau_start: 2.0
-  soft_vq_tau_end: 0.3
+  soft_vq_tau_end: 0.30
   soft_vq_tau_warm_steps: 8000
-  soft_vq_alpha_warm_steps: 10000
+  soft_vq_alpha_warm_steps: 12000
 
-  # EMA and codebook controls
+  # EMA controls
   ema_decay_start: 0.98
-  ema_decay_end: 0.99
-  ema_decay_warm_steps: 10000
-  ema_update_freeze_steps: 800
+  ema_decay_end: 0.98
+  ema_decay_warm_steps: 12000
+  ema_update_freeze_steps: 0
+
+  # Codebook maintenance
   reinit_dead_codes: true
   reinit_prob: 0.25
   dead_usage_threshold: 1
-  #codebook_init_path: "/public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/scripts/kmeans_centroids_512x128.npy"
+
+  # Leave empty if passing via CLI
+  codebook_init_path: ""
 
 data_params:
   npy_dir: "/public/home/zhangyangroup/chengshiz/keyuan.zhou/prp-dataset/filtered_curves_npy/"
   train_list: "train_list.txt"
   val_list: "val_list.txt"
-  train_batch_size: 256
-  val_batch_size: 256
+  train_batch_size: 128
+  val_batch_size: 128
   num_workers: 8
-
-
   pin_memory: true
 
 exp_params:
-  LR: 0.0001
+  LR: 0.00020
   weight_decay: 0.008
   manual_seed: 1265
   print_every: 600
 
-  # Base weights (will be overridden by schedules)
-  ss_weight: 1.20
-  bond_length_weight: 0.000
-  bond_angle_weight: 0.000
-  xyz_tv_lambda: 0.002
-  dir_weight: 0.000
-  dih_weight: 0.000
-  rmsd_weight: 1.50
+  # Base weights (overridden by schedules)
+  ss_weight: 0.80
+  rmsd_weight: 1.80
+  xyz_tv_lambda: 0.0000
 
-  # Warm start from stage1 checkpoint
-  #warm_start_ckpt: "/public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/ae_new_checkpoints_test/epochepoch=079.ckpt"
+  # Physics / geometry (overridden by schedules)
+  bond_length_weight: 0.0000
+  bond_angle_weight: 0.0000
+  dir_weight: 0.0000
+  dih_weight: 0.0000
 
-  checkpoint_dir: "./vq_s_gradient_ckpt_test11_15"
+  # Anti-crossing / global geometry consistency
+  lr_pdm_weight: 0.0000
+  pdm_weight: 0.0000
+  win_kabsch_weight: 0.0000
+  kappa_weight: 0.0
+  tau_weight: 0.0
+
+  # Geometry window parameters
+  pdm_window: 8
+  win_kabsch_size: 16
+  win_kabsch_stride: 8
+  lr_min_sep: 24
+  lr_stride: 8
+  lr_max_offsets: 8
+
+  # Leave empty if passing via CLI
+  warm_start_ckpt: ""
+
+  checkpoint_dir: "./checkpoints/vq_token64_K1024_D512_fromscratch"
   save_every_epochs: 10
   checkpoint_name_pattern: "epoch{epoch:03d}"
   lr_scheduler: "none"
 
-  # Training schedules
   schedules:
-    # Beta: gentle ramp for commitment loss
-    beta:
-      - [0, 0.005]
-      - [15, 0.005]
-      - [30, 0.005]
-      - [50, 0.005]
-      - [70, 0.005]
-
-    # Learning rate: mild decay
+    # LR schedule (epoch-based)
     LR:
-      - [0, 0.00010]
-      - [20, 0.00007]
-      - [40, 0.00005]
-      - [60, 0.00003]
-      - [70, 0.00002]
+      - [0,    0.00020]
+      - [60,   0.00020]
+      - [160,  0.00010]
+      - [360,  0.00005]
+      - [560,  0.00005]
+      - [650,  0.00008]
+      - [950,  0.00002]
+      - [1500, 0.00002]
 
-    # SS weight
-    ss_weight:
-      - [0, 3.50]
-      - [15, 8.50]
-      - [40, 14.50]
-      - [60, 26.50]
-      - [70, 32.50]
-      - [80, 36.50]
-      - [90, 40.50]
+    # VQ beta schedule (slow ramp-up)
+    beta:
+      - [0,    0.0000]
+      - [10,   0.0010]
+      - [30,   0.0030]
+      - [80,   0.0050]
+      - [150,  0.0070]
+      - [250,  0.0100]
+      - [510,  0.0010]
+      - [950,  0.0002]
+      - [1500, 0.0002]
 
-    # RMSD weight: gradually decrease
+    # RMSD weight: large -> small -> large (xyz -> ss -> xyz)
     rmsd_weight:
-      - [0, 0.60]
-      - [15, 0.60]
-      - [40, 0.60]
-      - [60, 0.60]
+      - [0,    1.80]
+      - [40,   1.80]
+      - [100,  1.20]
+      - [180,  0.90]
+      - [320,  0.80]
+      - [500,  0.90]
+      - [650,  1.50]
+      - [800,  1.60]
+      - [900,  1.90]
+      - [950,  2.10]
+      - [1500,  2.10]
 
-    # Enable usage entropy later in training
-    usage_entropy_lambda:
-      - [0, 0.000]
-      - [15, 0.0015]
-      - [30, 0.0030]
+    # SS weight: small -> large -> small
+    ss_weight:
+      - [0,    0.80]
+      - [40,   0.80]
+      - [100,  6.00]
+      - [180,  16.0]
+      - [320,  25.0]
+      - [500,  30.0]
+      - [650,  10.0]
+      - [800,  5.00]
+      - [900,  3.00]
+      - [950,  1.20]
+      - [1500, 1.20]
 
-    # Geometry losses: introduce gradually
+    # Mild smoothness: useful mid-stage, relax late for RMSD fine-tune
+    xyz_tv_lambda:
+      - [0,    0.0000]
+      - [80,   0.0008]
+      - [320,  0.0010]
+      - [650,  0.0005]
+      - [900,  0.0002]
+      - [950,  0.0002]
+
+    # ----------------------------
+    # Physics constraints (enabled early)
+    # ----------------------------
+
+    # Bond length constraint (start ~epoch 50)
     bond_length_weight:
-      - [0, 0.000]
-      - [25, 0.000]
-      - [45, 0.000]
+      - [0,    0.0000]
+      - [50,   0.0050]
+      - [120,  0.0150]
+      - [250,  0.0300]
+      - [500,  0.0400]
+      - [650,  0.0500]
+      - [950,  0.0500]
 
+    # Bond angle constraint (start ~epoch 50)
     bond_angle_weight:
-      - [0, 0.000]
-      - [25, 0.000]
-      - [45, 0.000]
+      - [0,    0.0000]
+      - [50,   0.0020]
+      - [120,  0.0060]
+      - [250,  0.0120]
+      - [500,  0.0160]
+      - [650,  0.0200]
+      - [950,  0.0200]
 
+    # Long-range PDM (anti-crossing / global distance consistency) MUST be on
+    lr_pdm_weight:
+      - [0,    0.0000]
+      - [50,   0.0010]
+      - [120,  0.0030]
+      - [250,  0.0060]
+      - [500,  0.0100]
+      - [650,  0.0120]
+      - [950,  0.0120]
+
+    # Local PDM (short-range shape consistency)
+    pdm_weight:
+      - [0,    0.0000]
+      - [50,   0.0005]
+      - [120,  0.0010]
+      - [250,  0.0018]
+      - [500,  0.0025]
+      - [650,  0.0030]
+      - [950,  0.0030]
+
+    # Window Kabsch (local rigid consistency)
+    win_kabsch_weight:
+      - [0,    0.0000]  
+      - [80,   0.0002]
+      - [250,  0.0006]
+      - [500,  0.0010]
+      - [650,  0.0012]
+      - [950,  0.0012]
+
+    # Keep these off unless you explicitly want to test them
     dir_weight:
-      - [0, 0.000]
-      - [30, 0.000]
-      - [50, 0.000]
+      - [0,    0.0000]
+      - [950,  0.0000]
 
     dih_weight:
-      - [0, 0.000]
-      - [30, 0.000]
-      - [50, 0.000]
+      - [0,    0.0000]
+      - [950,  0.0000]
+
+    usage_entropy_lambda:
+      - [0,    0.0000]
+      - [950,  0.0000]
 
 trainer_params:
   accelerator: gpu
   devices: 4
   strategy: ddp
   precision: 32
-  max_epochs: 850
+  max_epochs: 1500
   log_every_n_steps: 10
   num_sanity_val_steps: 0
   benchmark: true
@@ -160,4 +247,4 @@ trainer_params:
 
 logging_params:
   save_dir: "./logs/"
-  name: "VQ-stage2-fixed-softvq-enabled"
+  name: "VQ-stage2-token64-K1024-D512-fromscratch-physics"

@@ -11,14 +11,18 @@ Usage examples:
   # Stage 2: VQ fine-tune with warm start and codebook init
   python run.py \
       --config configs/stage2_vq.yaml \
-      --warm_start_ckpt /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/ae_new_checkpoints_test/epochepoch=epoch=079.ckpt \
-      --init_codebook scripts/kmeans_centroids_512x128.npy
+      --warm_start_ckpt /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/checkpoints/ae_1024_512/last.ckpt \
+      --init_codebook scripts/kmeans_centroids_1024x512.npy
+  python run.py \
+  --config configs/stage2_vq.yaml \
+  --warm_start_ckpt /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/checkpoints/vq_token64_K1024/epochepoch=009.ckpt
+    
 
   # Resume from a previous full checkpoint (optimizer, schedulers, etc.)
   # When --resume_ckpt is provided, warm-start and codebook init are skipped.
   python run.py \
       --config configs/stage2_vq.yaml \
-      --resume_ckpt /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/checkpoints/vq_s_gradient_ckpt_test11_15/epochepoch=549.ckpt
+      --resume_ckpt /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/checkpoints/vq_token64_K1024_D512_fromscratch/epochepoch=509.ckpt
 """
 
 import os
@@ -164,7 +168,7 @@ def main():
     logger = TensorBoardLogger(save_dir=str(log_dir), name=logger_name)
 
     # Checkpoint directory (default matches user's prior folder)
-    ckpt_dir = Path(exp_params.get("checkpoint_dir", "./ae_new_checkpoints_test"))
+    ckpt_dir = Path(exp_params.get("checkpoint_dir", "./checkpoints/ae_1024_512"))
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     # Save every N epochs and keep all

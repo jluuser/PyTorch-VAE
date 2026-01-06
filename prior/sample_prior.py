@@ -24,7 +24,7 @@ python prior/sample_prior.py \
   --top_k 0 \
   --top_p 1.0 \
   --indices_dtype int16 \
-  --out_dir /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/prior/prior_samples_300 \
+  --out_dir /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/prior/new_prior_samples_300 \
   --device cuda \
   --train_manifest /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/prior/out_prior_data/train/manifest.jsonl
 """

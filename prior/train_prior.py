@@ -34,7 +34,6 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.optim import AdamW
 from torch.cuda.amp import GradScaler, autocast
 
-# 把项目根目录 (PyTorch-VAE) 加到 sys.path
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from prior.datasets.prior_dataset import PriorIndexDataset, collate_pad, BucketBatchSampler

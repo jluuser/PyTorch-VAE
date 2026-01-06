@@ -1,57 +1,57 @@
-下面所有命令都假设你当前目录是：
+All commands below assume your current directory is:
 
 ```bash
 cd /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE
 ```
 
-先约定两个环境变量（和你原来一样）：
-## Step 1：从 VQVAE 提取 train / val 索引（不变）
+First, let's establish two environment variables (same as before):
 
-> 输出会写到：
+## Step 1: Extract train / val indices from VQVAE (Unchanged)
+
+> The output will be written to:
 > `/public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/out_prior_data/{train,val}`
-> 也就是你 `prior/configs/prior_config.yaml` 里面配置的那两个 manifest。
+> This corresponds to the two manifests configured in your `prior/configs/prior_config.yaml`.
 
-### 1.1 提取 train
+### 1.1 Extract train
 
 ```bash
 torchrun --nproc_per_node=4 scripts/extract_code_indices.py \
-  --ckpt  /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/checkpoints/vq_s_gradient_ckpt_test11_15/epochepoch=549.ckpt \
+  --ckpt  /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/checkpoints/vq_token64_K1024_D512_fromscratch/epochepoch=1399.ckpt \
   --yaml  /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/configs/stage2_vq.yaml \
-  --out_dir ./out_prior_data/train \
+  --out_dir ./prior/out_prior_token64_K1024_D512_data/train \
   --split train \
-  --num_workers 8 \
+  --num_workers 16 \
   --indices_dtype int16 \
-  --expect_latent_len 48 \
+  --expect_latent_len 64 \
   --pin_memory
 ```
 
-### 1.2 提取 val
+### 1.2 Extract val
 
 ```bash
 torchrun --nproc_per_node=4 scripts/extract_code_indices.py \
-  --ckpt  /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/checkpoints/vq_s_gradient_ckpt_test11_15/epochepoch=549.ckpt \
+  --ckpt  /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/checkpoints/vq_token64_K1024_D512_fromscratch/epochepoch=1399.ckpt \
   --yaml  /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/configs/stage2_vq.yaml \
-  --out_dir ./out_prior_data/val \
+  --out_dir ./prior/out_prior_token64_K1024_D512_data/val \
   --split val \
-  --num_workers 8 \
+  --num_workers 16 \
   --indices_dtype int16 \
-  --expect_latent_len 48 \
+  --expect_latent_len 64 \
   --pin_memory
 ```
 
-跑完后应该有：
+After running, you should have:
 
 ```text
 out_prior_data/train/manifest.jsonl
 out_prior_data/val/manifest.jsonl
 ```
 
-和 `prior/configs/prior_config.yaml` 里的路径要对上。
+These must match the paths in `prior/configs/prior_config.yaml`.
 
----
+-----
 
-## Step 2：训练 ** Transformer 先验**
-
+## Step 2: Train **Transformer Prior**
 
 ```bash
 torchrun --nproc_per_node=4 prior/train_prior.py \
@@ -59,60 +59,47 @@ torchrun --nproc_per_node=4 prior/train_prior.py \
   --vq_yaml  configs/stage2_vq.yaml
 ```
 
-训练结束后，在：
+After training ends, the files will be located at:
 
 ```text
 /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/prior_ckpts/
-    ├─ prior_best.pt   # val_nll 最好的
-    └─ prior_last.pt   # 最后一个
+    ├─ prior_best.pt   # best val_nll
+    └─ prior_last.pt   # the last one
 
-但是目前使用的是/public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/checkpoints/best_prior_ckpts    
+However, currently using: /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/checkpoints/best_prior_ckpts    
 ```
 
+-----
 
----
-
-## Step 3：**一次性生成 latent code 序列**
-
+## Step 3: **Generate latent code sequences**
 
 ```bash
 python prior/sample_prior.py \
-  --prior_ckpt /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/checkpoints/best_prior_ckpts/prior_best.pt \
-  --num_samples 300 \
-  --latent_len 48 \
+  --prior_ckpt /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/prior/prior_ckpts/prior_1_6.pt/prior_best.pt \
+  --num_samples 50 \
+  --latent_len 64 \
   --target_len 350 \
   --temperature 1.0 \
   --top_k 0 \
   --top_p 1.0 \
   --indices_dtype int16 \
-  --out_dir /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/prior/prior_samples_300 \
+  --out_dir /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/prior/prior_samples_1_6 \
   --device cuda \
-  --train_manifest /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/prior/out_prior_data/train/manifest.jsonl
+  --train_manifest /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/prior/out_prior_token64_K1024_D512_data/train/manifest.jsonl
 ```
 
+## Step 4: Decode generated codes into curves using VQVAE
 
-  
-## Step 4：用 VQVAE 把生成的 code 解码成曲线
-
-脚本：`scripts/decode_indices_with_vqvae.py`（保持不变）
-输入：Step 3 生成的 `samples_manifest.jsonl`
-输出：`prior_recons/` 里面的 `*_recon.npy`，每个是 `[L,C]` 的重建曲线。
+Script: `scripts/decode_indices_with_vqvae.py` (remains unchanged)
+Input: `samples_manifest.jsonl` generated in Step 3
+Output: `*_recon.npy` inside `prior_recons/`, where each file is an `[L,C]` reconstructed curve.
 
 ```bash
 python scripts/decode_indices_with_vqvae.py \
-  --vq_ckpt  /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/checkpoints/vq_s_gradient_ckpt_test11_15/epochepoch=549.ckpt \
+  --vq_ckpt  /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/checkpoints/vq_token64_K1024_D512_fromscratch/epochepoch=1399.ckpt \
   --vq_yaml  /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/configs/stage2_vq.yaml \
-  --samples_manifest /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/prior/prior_samples_300/samples_manifest.jsonl \
-  --out_dir /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/prior/prior_recons_300 \
-  --check_latent_len 48 \
+  --samples_manifest /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/prior/prior_samples_1_6/samples_manifest.jsonl \
+  --out_dir /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/prior/new_prior_recons_1_6 \
+  --check_latent_len 64 \
   --device cuda
 ```
-
-到这里，新版先验链路就是：
-
-1. **Stage2 ckpt → 提取 latent indices（train/val）**
-2. **indices manifest →  Transformer prior**
-3. **prior_best.pt → MaskGIT 一次性采样 indices（长 48）**
-4. **采样 indices → VQVAE 解码成蛋白质曲线**
-
-
