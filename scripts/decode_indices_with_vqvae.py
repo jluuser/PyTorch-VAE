@@ -2,6 +2,11 @@
 # coding: utf-8
 """
 Decode fixed-N code indices to curves with a trained VQVAE.
+
+Supports both:
+  - single-codebook VQ (num_quantizers = 1)
+  - residual VQ (num_quantizers > 1) with flattened indices of length
+    latent_tokens * num_quantizers, where codes per token are summed.
 """
 
 import argparse
@@ -65,13 +70,59 @@ def get_codebook(core) -> torch.Tensor:
 
 
 @torch.no_grad()
+def get_num_quantizers(core) -> int:
+    q = getattr(core, "quantizer", None)
+    if q is None:
+        return 1
+    n_q = getattr(q, "num_quantizers", 1)
+    try:
+        return int(n_q)
+    except Exception:
+        return 1
+
+
+@torch.no_grad()
 def indices_to_latent(core, indices_np: np.ndarray) -> torch.Tensor:
+    """
+    Map discrete indices to latent z_q.
+
+    For single-codebook VQ (num_quantizers=1):
+        indices_np: [N]
+        z_q: [1, N, D]
+
+    For residual VQ (num_quantizers>1) with flattened indices:
+        indices_np: [N_flat] where N_flat = N_tokens * num_quantizers
+        We interpret the sequence as:
+            [t0_level0, t0_level1, ..., t0_levelQ-1,
+             t1_level0, t1_level1, ..., t1_levelQ-1, ...]
+        Then:
+            embed -> [1, N_flat, D]
+            reshape -> [1, N_tokens, num_quantizers, D]
+            sum over num_quantizers -> [1, N_tokens, D]
+    """
     if indices_np.ndim != 1:
         raise ValueError(f"indices must be 1D, got {indices_np.shape}")
     dev = next(core.parameters()).device
-    inds = torch.from_numpy(indices_np).long().unsqueeze(0).to(dev)  # [1,N]
-    E = get_codebook(core).to(dev)  # [K,D]
-    z_q = F.embedding(inds, E)  # [1,N,D]
+    inds = torch.from_numpy(indices_np).long().unsqueeze(0).to(dev)  # [1, N_flat]
+    E = get_codebook(core).to(dev)  # [K_total, D]
+
+    num_q = get_num_quantizers(core)
+    # Simple case: single codebook
+    if num_q <= 1:
+        z_q = F.embedding(inds, E)  # [1, N_flat, D]
+        return z_q
+
+    # Residual VQ case
+    N_flat = int(inds.shape[1])
+    if N_flat % num_q != 0:
+        raise ValueError(
+            f"flattened indices length {N_flat} is not divisible by num_quantizers={num_q}"
+        )
+    N_tokens = N_flat // num_q
+
+    z_all = F.embedding(inds, E)  # [1, N_flat, D]
+    z_all = z_all.view(1, N_tokens, num_q, -1)  # [1, N, Q, D]
+    z_q = z_all.sum(dim=2)  # [1, N, D]
     return z_q
 
 
@@ -79,29 +130,33 @@ def indices_to_latent(core, indices_np: np.ndarray) -> torch.Tensor:
 def decode_one(core, indices_np: np.ndarray, target_len: int) -> torch.Tensor:
     dev = next(core.parameters()).device
 
-    # If model provides a helper, use it
+    # If model provides a helper, use it (it may already know about RVQ layout)
     if hasattr(core, "decode_from_indices") and callable(core.decode_from_indices):
-        inds = torch.from_numpy(indices_np).long().unsqueeze(0).to(dev)  # [1,N]
-        out = core.decode_from_indices(inds, target_len=target_len)
+        inds = torch.from_numpy(indices_np).long().unsqueeze(0).to(dev)  # [1, N_flat]
+        try:
+            out = core.decode_from_indices(inds, target_len=target_len)
+        except TypeError:
+            out = core.decode_from_indices(inds)
         return out
 
-    # Fallback: embed via codebook and call decode
-    z_q = indices_to_latent(core, indices_np)  # [1,N,D]
+    # Fallback: reconstruct z_q from indices and call decode
+    z_q = indices_to_latent(core, indices_np)  # [1, N_latent, D]
+    B, L_latent, _ = z_q.shape
 
-    max_len = int(getattr(core, "max_seq_len", target_len))
-    L = int(min(target_len, max_len))
-    mask = torch.ones(1, L, dtype=torch.bool, device=z_q.device)
+    # build latent mask (all valid)
+    mask = torch.ones(B, L_latent, dtype=torch.bool, device=z_q.device)
 
-    # Default: decode(z_q, mask=mask)
+    # Try various decode signatures
     try:
-        out = core.decode(z_q, mask=mask)
+        out = core.decode(z_q, mask=mask, target_len=int(target_len))
     except TypeError:
-        # Try positional mask only
         try:
-            out = core.decode(z_q, mask)
+            out = core.decode(z_q, mask=mask)
         except TypeError:
-            # Last resort: maybe has target_len kwarg
-            out = core.decode(z_q, target_len=L)
+            try:
+                out = core.decode(z_q, int(target_len))
+            except TypeError:
+                out = core.decode(z_q)
     return out
 
 
@@ -145,9 +200,11 @@ def main():
 
         idxs = np.load(str(idx_path), allow_pickle=False)
         if args.check_latent_len > 0 and int(idxs.shape[0]) != int(args.check_latent_len):
-            print(f"[warn] latent_len mismatch {idxs.shape[0]} != {args.check_latent_len} at {idx_path}")
+            print(
+                f"[warn] latent_len mismatch {idxs.shape[0]} != {args.check_latent_len} at {idx_path}"
+            )
 
-        recon = decode_one(core, idxs, tlen)  # [1,L,C]
+        recon = decode_one(core, idxs, tlen)  # [1, L, C]
         save_path = out_dir / (idx_path.stem + "_recon.npy")
         np.save(str(save_path), recon.squeeze(0).cpu().numpy(), allow_pickle=False)
         n_ok += 1

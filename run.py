@@ -11,8 +11,8 @@ Usage examples:
   # Stage 2: VQ fine-tune with warm start and codebook init
   python run.py \
       --config configs/stage2_vq.yaml \
-      --warm_start_ckpt /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/checkpoints/ae_1024_512/last.ckpt \
-      --init_codebook scripts/kmeans_centroids_1024x512.npy
+      --warm_start_ckpt /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/checkpoints/ae_1024_512_residualVQ/last.ckpt \
+      --init_codebook scripts/kmeans_residual_centroids_L4x1024x512.npy
   python run.py \
   --config configs/stage2_vq.yaml \
   --warm_start_ckpt /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/checkpoints/vq_token64_K1024/epochepoch=009.ckpt
@@ -168,7 +168,7 @@ def main():
     logger = TensorBoardLogger(save_dir=str(log_dir), name=logger_name)
 
     # Checkpoint directory (default matches user's prior folder)
-    ckpt_dir = Path(exp_params.get("checkpoint_dir", "./checkpoints/ae_1024_512"))
+    ckpt_dir = Path(exp_params.get("checkpoint_dir", "./checkpoints/ae_1024_512_residualVQ"))
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     # Save every N epochs and keep all

@@ -59,8 +59,11 @@ class PriorIndexDataset(Dataset):
                 rec = json.loads(line)
                 # normalize fields
                 rec["indices_path"] = str(rec["indices_path"])
+                # prefer explicit length if present; otherwise, allow latent_len as a hint
                 if "length" in rec:
                     rec["length"] = int(rec["length"])
+                elif "latent_len" in rec:
+                    rec["length"] = int(rec["latent_len"])
                 self.records.append(rec)
 
         if len(self.records) == 0:

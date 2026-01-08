@@ -1,6 +1,6 @@
 # VQVAE Stage2 (from-scratch) config
-# - code_dim=512
-# - Physics constraints enabled early (start ~epoch 50) with ramps
+# - code_dim=512, residual VQ (4 levels)
+# - Physics constraints enabled early (start ~epoch 30-50) with ramps
 # - ss_weight: small -> large -> small
 # - rmsd_weight: large -> small -> large
 
@@ -14,9 +14,11 @@ model_params:
 
   # VQ core
   use_vq: true
-  codebook_size: 1024
+  residual_vq: true
+  num_quantizers: 4
+  codebook_size: 1024        # codes per level, total codes = num_quantizers * codebook_size
   code_dim: 512
-  beta: 0.00
+  beta: 0.0000               # will be overridden by schedule
 
   # Tokenizer (L -> N)
   latent_tokens: 64
@@ -33,7 +35,7 @@ model_params:
   rigid_aug_prob: 0.0
   pairwise_sample_k: 32
 
-  # Soft VQ
+  # Soft VQ (disabled for residual VQ)
   soft_vq_use: false
   soft_vq_tau_start: 2.0
   soft_vq_tau_end: 0.30
@@ -67,7 +69,7 @@ exp_params:
   LR: 0.00020
   weight_decay: 0.008
   manual_seed: 1265
-  print_every: 600
+  print_every: 900
 
   # Base weights (overridden by schedules)
   ss_weight: 0.80
@@ -98,144 +100,118 @@ exp_params:
   # Leave empty if passing via CLI
   warm_start_ckpt: ""
 
-  checkpoint_dir: "./checkpoints/vq_token64_K1024_D512_fromscratch"
+  checkpoint_dir: "./checkpoints/vq_token64_K1024_D512_ResidualVQ_fromscratch"
   save_every_epochs: 10
   checkpoint_name_pattern: "epoch{epoch:03d}"
   lr_scheduler: "none"
 
   schedules:
-    # LR schedule (epoch-based)
+    # LR schedule (epoch-based, 0 -> 300)
     LR:
       - [0,    0.00020]
-      - [60,   0.00020]
-      - [160,  0.00010]
-      - [360,  0.00005]
-      - [560,  0.00005]
-      - [650,  0.00008]
-      - [950,  0.00002]
-      - [1500, 0.00002]
+      - [30,   0.00020]
+      - [180,  0.00010]
+      - [200,  0.00002]
 
-    # VQ beta schedule (slow ramp-up)
+    # VQ beta schedule (slow ramp-up, then down)
     beta:
-      - [0,    0.0000]
-      - [10,   0.0010]
-      - [30,   0.0030]
+      - [0,    0.0005]
+      - [5,    0.0015]
+      - [20,   0.0030]
       - [80,   0.0050]
-      - [150,  0.0070]
-      - [250,  0.0100]
-      - [510,  0.0010]
-      - [950,  0.0002]
-      - [1500, 0.0002]
+      - [140,  0.0060]
+      - [200,  0.0030]
 
-    # RMSD weight: large -> small -> large (xyz -> ss -> xyz)
+    # RMSD weight: large -> small -> large (xyz-focus -> ss/physics-focus -> rmsd fine-tune)
     rmsd_weight:
       - [0,    1.80]
-      - [40,   1.80]
-      - [100,  1.20]
-      - [180,  0.90]
-      - [320,  0.80]
-      - [500,  0.90]
-      - [650,  1.50]
-      - [800,  1.60]
-      - [900,  1.90]
-      - [950,  2.10]
-      - [1500,  2.10]
+      - [30,   1.80]
+      - [80,   1.20]
+      - [140,  0.90]
+      - [200,  1.20]
 
     # SS weight: small -> large -> small
     ss_weight:
       - [0,    0.80]
-      - [40,   0.80]
-      - [100,  6.00]
-      - [180,  16.0]
-      - [320,  25.0]
-      - [500,  30.0]
-      - [650,  10.0]
-      - [800,  5.00]
-      - [900,  3.00]
-      - [950,  1.20]
-      - [1500, 1.20]
+      - [30,   0.80]
+      - [80,   6.00]
+      - [140,  10.0]
+      - [200,  1.20]
 
     # Mild smoothness: useful mid-stage, relax late for RMSD fine-tune
     xyz_tv_lambda:
       - [0,    0.0000]
-      - [80,   0.0008]
-      - [320,  0.0010]
-      - [650,  0.0005]
-      - [900,  0.0002]
-      - [950,  0.0002]
+      - [60,   0.0008]
+      - [160,  0.0010]
+      - [200,  0.0005]
+    
 
     # ----------------------------
     # Physics constraints (enabled early)
     # ----------------------------
 
-    # Bond length constraint (start ~epoch 50)
+    # Bond length constraint
     bond_length_weight:
       - [0,    0.0000]
-      - [50,   0.0050]
-      - [120,  0.0150]
-      - [250,  0.0300]
-      - [500,  0.0400]
-      - [650,  0.0500]
-      - [950,  0.0500]
+      - [30,   0.0050]
+      - [100,  0.0150]
+      - [180,  0.0300]
+      - [200,  0.0400]
+    
 
-    # Bond angle constraint (start ~epoch 50)
+    # Bond angle constraint
     bond_angle_weight:
       - [0,    0.0000]
-      - [50,   0.0020]
-      - [120,  0.0060]
-      - [250,  0.0120]
-      - [500,  0.0160]
-      - [650,  0.0200]
-      - [950,  0.0200]
+      - [30,   0.0020]
+      - [100,  0.0060]
+      - [180,  0.0120]
+      - [200,  0.0160]
+    
 
-    # Long-range PDM (anti-crossing / global distance consistency) MUST be on
+    # Long-range PDM (anti-crossing / global distance consistency)
     lr_pdm_weight:
       - [0,    0.0000]
-      - [50,   0.0010]
+      - [40,   0.0010]
       - [120,  0.0030]
-      - [250,  0.0060]
-      - [500,  0.0100]
-      - [650,  0.0120]
-      - [950,  0.0120]
+      - [180,  0.0060]
+      - [200,  0.0100]
+  
 
     # Local PDM (short-range shape consistency)
     pdm_weight:
       - [0,    0.0000]
-      - [50,   0.0005]
+      - [40,   0.0005]
       - [120,  0.0010]
-      - [250,  0.0018]
-      - [500,  0.0025]
-      - [650,  0.0030]
-      - [950,  0.0030]
+      - [180,  0.0018]
+      - [200,  0.0025]
 
     # Window Kabsch (local rigid consistency)
     win_kabsch_weight:
-      - [0,    0.0000]  
-      - [80,   0.0002]
-      - [250,  0.0006]
-      - [500,  0.0010]
-      - [650,  0.0012]
-      - [950,  0.0012]
+      - [0,    0.0000]
+      - [60,   0.0002]
+      - [150,  0.0006]
+      - [200,  0.0010]
+      
 
     # Keep these off unless you explicitly want to test them
     dir_weight:
       - [0,    0.0000]
-      - [950,  0.0000]
+      - [200,  0.0000]
 
     dih_weight:
       - [0,    0.0000]
-      - [950,  0.0000]
+      - [200,  0.0000]
 
     usage_entropy_lambda:
       - [0,    0.0000]
-      - [950,  0.0000]
+      - [200,  0.0000]
 
 trainer_params:
   accelerator: gpu
   devices: 4
   strategy: ddp
   precision: 32
-  max_epochs: 1500
+  max_epochs: 200
   log_every_n_steps: 10
   num_sanity_val_steps: 0
   benchmark: true
@@ -247,4 +223,4 @@ trainer_params:
 
 logging_params:
   save_dir: "./logs/"
-  name: "VQ-stage2-token64-K1024-D512-fromscratch-physics"
+  name: "VQ-stage2-token64-K1024-D512-ResidualVQ-fromscratch-physics"

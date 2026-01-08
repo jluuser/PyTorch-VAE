@@ -13,6 +13,8 @@ EPS = 1e-8
 
 # ---------------------------------------------
 # Vector Quantizer (EMA), L2 distance
+#   - Supports both single-level VQ (num_quantizers=1)
+#   - And residual multi-level VQ (num_quantizers>1)
 # ---------------------------------------------
 class VectorQuantizerEMA(nn.Module):
     def __init__(
@@ -28,10 +30,14 @@ class VectorQuantizerEMA(nn.Module):
         print_init: bool = True,
         diag_qe_cap: float = 10.0,
         diag_qe_bins: int = 64,
+        num_quantizers: int = 1,
     ):
         super().__init__()
-        self.K = int(num_embeddings)
+        self.num_quantizers = int(num_quantizers)
+        self.K_per = int(num_embeddings)
+        self.K = int(self.num_quantizers * self.K_per)
         self.D = int(embedding_dim)
+
         self.beta = float(beta)
         self.decay = float(decay)
         self.eps = float(eps)
@@ -56,7 +62,17 @@ class VectorQuantizerEMA(nn.Module):
         self.register_buffer("_ep_qe_hist", torch.zeros(self.diag_qe_bins))
 
         if print_init:
-            print(f"[VQ] EMA (L2): K={self.K}, D={self.D}, beta={self.beta}, decay={self.decay}")
+            if self.num_quantizers > 1:
+                print(
+                    f"[RVQ] EMA (L2): L={self.num_quantizers}, "
+                    f"K_per={self.K_per}, K_total={self.K}, D={self.D}, "
+                    f"beta={self.beta}, decay={self.decay}"
+                )
+            else:
+                print(
+                    f"[VQ] EMA (L2): K={self.K}, D={self.D}, "
+                    f"beta={self.beta}, decay={self.decay}"
+                )
 
     @torch.no_grad()
     def _ema_update(self, flat_raw: Tensor, indices: Tensor):
@@ -65,10 +81,10 @@ class VectorQuantizerEMA(nn.Module):
         one_hot = F.one_hot(indices, num_classes=self.K).float()
         cluster_size = one_hot.sum(dim=0)
         embed_sum = one_hot.t() @ flat_raw
-    
+
         self.ema_cluster_size.mul_(self.decay).add_(cluster_size * (1 - self.decay))
         self.ema_embedding.mul_(self.decay).add_(embed_sum * (1 - self.decay))
-    
+
         updated = self.ema_embedding / (self.ema_cluster_size.unsqueeze(1) + self.eps)
         self.embedding.copy_(updated)
 
@@ -100,65 +116,23 @@ class VectorQuantizerEMA(nn.Module):
         self._ep_qe_hist.zero_()
 
     @torch.no_grad()
-    def _accumulate_epoch_stats(
-        self,
-        flat_raw: Tensor,
-        indices: Tensor,
-        z_e_flat: Tensor,
-        z_q_flat: Tensor,
-        valid_mask: Optional[Tensor] = None,
-    ):
-        if flat_raw.numel() == 0:
-            return
-        device = flat_raw.device
-        if valid_mask is None:
-            valid_mask = torch.ones(flat_raw.size(0), dtype=torch.bool, device=device)
-        if not valid_mask.any():
-            return
-
-        fn = flat_raw[valid_mask]
-        idxv = indices[valid_mask]
-        zev = z_e_flat[valid_mask]
-        zqv = z_q_flat[valid_mask]
-
-        usage = torch.bincount(idxv, minlength=self.K).float()
-        self._ep_usage.add_(usage)
-
-        fn_n = fn / fn.norm(dim=1, keepdim=True).clamp_min(1e-8)
-        emb_n = self.embedding / self.embedding.norm(dim=1, keepdim=True).clamp_min(1e-8)
-        dots = fn_n @ emb_n.t()
-        top2 = torch.topk(dots, k=2, dim=1).values
-        s1 = top2[:, 0]
-        s2 = top2[:, 1]
-        self._ep_top1_sum.add_(s1.sum())
-        self._ep_top2_sum.add_(s2.sum())
-        self._ep_cnt.add_(torch.tensor(float(fn_n.size(0)), device=device))
-
-        qe = (zqv - zev).pow(2).sum(dim=1)
-        self._ep_qe_sum.add_(qe.sum())
-
-        if self.diag_qe_bins > 0:
-            cap = self.diag_qe_cap if self.diag_qe_cap > 0 else float(qe.max().item() + 1e-6)
-            qec = qe.clamp_min(0.0).clamp_max(cap)
-            denom = max(cap, 1e-12)
-            bin_idx = torch.clamp((qec / denom * (self.diag_qe_bins - 1)).long(),
-                                  min=0, max=self.diag_qe_bins - 1)
-            hist = torch.bincount(bin_idx, minlength=self.diag_qe_bins).float()
-            self._ep_qe_hist.add_(hist)
-
-    @torch.no_grad()
     def get_epoch_stats(self) -> dict:
         usage = self._ep_usage.detach().cpu()
         cnt = float(self._ep_cnt.item())
         if cnt <= 0:
             return {
-                "usage_hist": usage, "margin_mean": 0.0, "qe_mean": 0.0, "qe_p90": 0.0,
-                "n_positions": 0, "perplexity": 0.0, "dead_ratio": 0.0
+                "usage_hist": usage,
+                "margin_mean": 0.0,
+                "qe_mean": 0.0,
+                "qe_p90": 0.0,
+                "n_positions": 0,
+                "perplexity": 0.0,
+                "dead_ratio": 0.0,
             }
-    
+
         margin_mean = float(((self._ep_top1_sum - self._ep_top2_sum) / cnt).item())
         qe_mean = float((self._ep_qe_sum / cnt).item())
-    
+
         total = float(usage.sum().item())
         if total > 0:
             p = (usage / max(total, 1e-12)).clamp_min(1e-12)
@@ -166,7 +140,7 @@ class VectorQuantizerEMA(nn.Module):
             dead_ratio = float((usage == 0).float().mean().item())
         else:
             perplexity, dead_ratio = 0.0, 0.0
-    
+
         qe_p90 = 0.0
         hist = self._ep_qe_hist.detach().cpu()
         total_hist = float(hist.sum().item())
@@ -178,7 +152,7 @@ class VectorQuantizerEMA(nn.Module):
                 idx = self.diag_qe_bins - 1
             bin_w = self.diag_qe_cap / max(self.diag_qe_bins, 1)
             qe_p90 = (idx + 0.5) * bin_w
-    
+
         return {
             "usage_hist": usage,
             "margin_mean": margin_mean,
@@ -195,56 +169,117 @@ class VectorQuantizerEMA(nn.Module):
 
     def forward(
         self,
-        z_e: Tensor,  # [B,M,D]
+        z_e: Tensor,  # [B, M, D]
         do_ema_update: bool = True,
         allow_reinit: bool = True,
         mask: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         B, M, D = z_e.shape
-        flat = z_e.reshape(-1, D)
-        distances = (
-            flat.pow(2).sum(dim=1, keepdim=True)
-            - 2.0 * torch.matmul(flat, self.embedding.t())
-            + self.embedding.pow(2).sum(dim=1, keepdim=True).t()
-        )
-        indices = torch.argmin(distances, dim=1)
-        z_q = F.embedding(indices, self.embedding).view(B, M, D)
+        device = z_e.device
+        flat = z_e.reshape(-1, D)  # [N, D], N = B*M
 
-        if self.training and do_ema_update:
-            if mask is None:
-                self._ema_update(flat.detach(), indices.detach())
-            else:
-                valid = mask.reshape(-1)
-                if valid.any():
-                    self._ema_update(flat[valid].detach(), indices[valid].detach())
+        # Single-level VQ
+        if self.num_quantizers == 1:
+            distances = (
+                flat.pow(2).sum(dim=1, keepdim=True)
+                - 2.0 * torch.matmul(flat, self.embedding.t())
+                + self.embedding.pow(2).sum(dim=1, keepdim=True).t()
+            )
+            indices = torch.argmin(distances, dim=1)  # [N]
+            z_q = F.embedding(indices, self.embedding).view(B, M, D)
 
+            if self.training and do_ema_update:
+                if mask is None:
+                    self._ema_update(flat.detach(), indices.detach())
+                else:
+                    valid = mask.reshape(-1)
+                    if valid.any():
+                        self._ema_update(flat[valid].detach(), indices[valid].detach())
+
+            z_q_st = z_e + (z_q - z_e).detach()
+
+            with torch.no_grad():
+                if mask is not None:
+                    valid = mask.reshape(-1)
+                    idx_use = indices[valid] if valid.any() else indices[:0]
+                    usage_inst = torch.bincount(idx_use, minlength=self.K).float()
+                else:
+                    usage_inst = torch.bincount(indices, minlength=self.K).float()
+
+                total = usage_inst.sum().clamp_min(1.0)
+                probs = usage_inst / total
+                nz = probs > 0
+                perplexity = (
+                    torch.exp(-(probs[nz] * probs[nz].log()).sum())
+                    if nz.any()
+                    else torch.tensor(0.0, device=device)
+                )
+                dead_ratio = (usage_inst == 0).float().mean()
+
+                self._ep_usage.add_(usage_inst)
+                self._ep_cnt.add_(torch.tensor(float(flat.size(0)), device=device))
+
+            stats = torch.stack([perplexity, dead_ratio])
+            return z_q_st, z_q, indices.view(B, M), stats
+
+        # Residual multi-level VQ
+        N = flat.size(0)
+        residual = flat  # [N, D]
+        all_indices = []
+        all_zq = []
+
+        valid = mask.reshape(-1) if mask is not None else None
+
+        for level in range(self.num_quantizers):
+            start = level * self.K_per
+            end = start + self.K_per
+            emb_l = self.embedding[start:end]  # [K_per, D]
+
+            distances = (
+                residual.pow(2).sum(dim=1, keepdim=True)
+                - 2.0 * torch.matmul(residual, emb_l.t())
+                + emb_l.pow(2).sum(dim=1, keepdim=True).t()
+            )  # [N, K_per]
+
+            idx_l = torch.argmin(distances, dim=1)  # [N]
+            global_idx_l = idx_l + start           # [N]
+            all_indices.append(global_idx_l)
+
+            z_q_flat_l = F.embedding(idx_l, emb_l)  # [N, D]
+            all_zq.append(z_q_flat_l)
+
+            if self.training and do_ema_update:
+                if valid is not None:
+                    if valid.any():
+                        self._ema_update(residual[valid].detach(), global_idx_l[valid].detach())
+                else:
+                    self._ema_update(residual.detach(), global_idx_l.detach())
+
+            residual = residual - z_q_flat_l
+
+        all_indices_cat = torch.cat(all_indices, dim=0)          # [L*N]
+        z_q_flat_total = torch.stack(all_zq, dim=0).sum(dim=0)   # [N, D]
+        z_q = z_q_flat_total.view(B, M, D)
         z_q_st = z_e + (z_q - z_e).detach()
 
         with torch.no_grad():
-            valid_vec = mask.reshape(-1) if mask is not None else None
-            self._accumulate_epoch_stats(
-                flat_raw=flat.detach(),
-                indices=indices.detach(),
-                z_e_flat=flat.detach(),
-                z_q_flat=z_q.reshape(-1, D).detach(),
-                valid_mask=valid_vec,
-            )
-
-        with torch.no_grad():
-            if mask is not None:
-                valid = mask.reshape(-1)
-                idx_use = indices[valid] if valid.any() else indices[:0]
-                usage_inst = torch.bincount(idx_use, minlength=self.K).float()
-            else:
-                usage_inst = torch.bincount(indices, minlength=self.K).float()
+            usage_inst = torch.bincount(all_indices_cat, minlength=self.K).float()
             total = usage_inst.sum().clamp_min(1.0)
             probs = usage_inst / total
             nz = probs > 0
-            perplexity = torch.exp(-(probs[nz] * probs[nz].log()).sum()) if nz.any() else torch.tensor(0.0, device=z_e.device)
+            perplexity = (
+                torch.exp(-(probs[nz] * probs[nz].log()).sum())
+                if nz.any()
+                else torch.tensor(0.0, device=device)
+            )
             dead_ratio = (usage_inst == 0).float().mean()
 
+            self._ep_usage.add_(usage_inst)
+            self._ep_cnt.add_(torch.tensor(float(all_indices_cat.size(0)), device=device))
+
         stats = torch.stack([perplexity, dead_ratio])
-        return z_q_st, z_q, indices.view(B, M), stats
+
+        return z_q_st, z_q, all_indices_cat, stats
 
 
 # ---------------------------------------------
@@ -276,8 +311,8 @@ class LatentTokenizer(nn.Module):
         # x: [B,L,d], key_padding_mask: [B,L] with True for PAD
         B = x.size(0)
         q = self.queries.unsqueeze(0).expand(B, -1, -1)      # [B,N,d]
-        kv = x                                                # [B,L,d]
-        kpm = key_padding_mask  # True=PAD
+        kv = x                                               # [B,L,d]
+        kpm = key_padding_mask
         for blk in self.layers:
             qn  = blk["ln_q"](q)
             kvn = blk["ln_kv"](kv)
@@ -325,7 +360,7 @@ def _dihedral_cos_sin(x: Tensor) -> Tensor:
 
 
 # ---------------------------------------------
-# VQ-VAE (minimal, query-tokenized) - FIXED VERSION
+# VQ-VAE (minimal, query-tokenized)
 # ---------------------------------------------
 class VQVAE(nn.Module):
     def __init__(
@@ -339,6 +374,8 @@ class VQVAE(nn.Module):
         code_dim: int = 128,
         beta: float = 0.25,
         use_vq: bool = True,
+        residual_vq: bool = False,  # kept for API, but actual behavior is from num_quantizers
+        num_quantizers: int = 1,
         label_smoothing: float = 0.0,
         ss_tv_lambda: float = 0.0,
         usage_entropy_lambda: float = 0.0,
@@ -374,8 +411,15 @@ class VQVAE(nn.Module):
         self.hidden_dim = int(hidden_dim)
         self.code_dim = int(code_dim)
         self.max_seq_len = int(max_seq_len)
-        self._beta = float(beta)
+
         self.use_vq = bool(use_vq)
+        self._beta = float(beta)
+
+        # Quantizer layout
+        self.num_quantizers = int(num_quantizers)
+        # residual_vq flag is derived from num_quantizers > 1
+        self.residual_vq = self.use_vq and (self.num_quantizers > 1)
+
         self.label_smoothing = float(label_smoothing)
         self.ss_tv_lambda = float(ss_tv_lambda)
         self.usage_entropy_lambda = float(usage_entropy_lambda)
@@ -418,13 +462,13 @@ class VQVAE(nn.Module):
         self.ln_geo = nn.LayerNorm(self.hidden_dim)
         self.ln_ss = nn.LayerNorm(self.hidden_dim)
         ss_enc_layer = nn.TransformerEncoderLayer(
-            d_model=self.hidden_dim, 
-            nhead=num_heads, 
-            batch_first=True, 
-            dropout=0.1, 
+            d_model=self.hidden_dim,
+            nhead=num_heads,
+            batch_first=True,
+            dropout=0.1,
             norm_first=True
         )
-        self.ss_encoder = nn.TransformerEncoder(ss_enc_layer, num_layers=2) 
+        self.ss_encoder = nn.TransformerEncoder(ss_enc_layer, num_layers=2)
         self._grad_monitor_enabled = False
         self._grad_hooks = []
 
@@ -454,19 +498,23 @@ class VQVAE(nn.Module):
             nn.LayerNorm(self.hidden_dim),
         )
 
-        # Quantizer
-        self.quantizer = VectorQuantizerEMA(
-            num_embeddings=codebook_size,
-            embedding_dim=self.code_dim,
-            beta=beta,
-            decay=0.98,
-            eps=1e-5,
-            reinit_dead_codes=reinit_dead_codes,
-            reinit_prob=reinit_prob,
-            dead_usage_threshold=dead_usage_threshold,
-            print_init=print_init,
-        )
-        self.quantizer.beta = self._beta
+        # Quantizer (single-level or residual depending on num_quantizers)
+        if self.use_vq:
+            self.quantizer = VectorQuantizerEMA(
+                num_embeddings=codebook_size,      # codes per level
+                embedding_dim=self.code_dim,
+                beta=beta,
+                decay=0.98,
+                eps=1e-5,
+                reinit_dead_codes=reinit_dead_codes,
+                reinit_prob=reinit_prob,
+                dead_usage_threshold=dead_usage_threshold,
+                print_init=print_init,
+                num_quantizers=self.num_quantizers,
+            )
+            self.quantizer.beta = self._beta
+        else:
+            self.quantizer = None
 
         # Decoder
         self.from_code = nn.Linear(self.code_dim, self.hidden_dim)
@@ -495,8 +543,10 @@ class VQVAE(nn.Module):
 
         if print_init:
             print(
-                f"[Model] VQVAE(minimal): H={self.hidden_dim}, Dcode={self.code_dim}, "
-                f"use_vq={self.use_vq}, tokensN={self.latent_n_tokens}, ema_freeze_steps={self.ema_update_freeze_steps}"
+                f"[Model] VQVAE: H={self.hidden_dim}, Dcode={self.code_dim}, "
+                f"use_vq={self.use_vq}, residual_vq={self.residual_vq}, "
+                f"q_levels={self.num_quantizers}, tokensN={self.latent_n_tokens}, "
+                f"ema_freeze_steps={self.ema_update_freeze_steps}"
             )
 
     @property
@@ -506,7 +556,8 @@ class VQVAE(nn.Module):
     @beta.setter
     def beta(self, value):
         self._beta = float(value)
-        self.quantizer.beta = float(value)
+        if self.quantizer is not None:
+            self.quantizer.beta = float(value)
 
     def set_epoch_context(self, epoch: int, steps_per_epoch: int = 1):
         self._curr_epoch = int(epoch)
@@ -521,14 +572,42 @@ class VQVAE(nn.Module):
 
     @torch.no_grad()
     def init_codebook_from_centroids(self, centroids: Tensor):
-        if centroids.shape != (self.quantizer.K, self.code_dim):
-            raise ValueError(f"Centroid shape mismatch: expected {(self.quantizer.K, self.code_dim)}, got {tuple(centroids.shape)}")
-        self.quantizer.embedding.copy_(centroids)
+        # Accept either [K, D] or [L, K_per, D] for residual codebooks
+        if centroids.dim() == 3:
+            L, K_per, D = centroids.shape
+            if D != self.code_dim:
+                raise ValueError(
+                    f"Centroid D mismatch: expected {self.code_dim}, got {D}"
+                )
+            if self.quantizer is None:
+                raise ValueError("Quantizer is not initialized.")
+            if L * K_per != self.quantizer.K:
+                raise ValueError(
+                    f"Centroid K mismatch: expected {self.quantizer.K}, got {L * K_per}"
+                )
+            C_flat = centroids.view(-1, D)
+        elif centroids.dim() == 2:
+            if self.quantizer is None:
+                raise ValueError("Quantizer is not initialized.")
+            if centroids.shape != (self.quantizer.K, self.code_dim):
+                raise ValueError(
+                    f"Centroid shape mismatch: expected "
+                    f"{(self.quantizer.K, self.code_dim)}, got {tuple(centroids.shape)}"
+                )
+            C_flat = centroids
+        else:
+            raise ValueError(f"Unsupported centroid shape: {tuple(centroids.shape)}")
+
+        device = self.quantizer.embedding.device
+        C_flat = C_flat.to(device=device, dtype=self.quantizer.embedding.dtype)
+        self.quantizer.embedding.copy_(C_flat)
         if hasattr(self.quantizer, "ema_embedding"):
-            self.quantizer.ema_embedding.copy_(centroids)
+            self.quantizer.ema_embedding.copy_(C_flat)
         if hasattr(self.quantizer, "ema_cluster_size"):
-            self.quantizer.ema_cluster_size.copy_(torch.ones(self.quantizer.K, device=centroids.device))
-        print(f"[Codebook Init] Loaded {centroids.shape} centroids.")
+            self.quantizer.ema_cluster_size.copy_(
+                torch.ones(self.quantizer.K, device=device)
+            )
+        print(f"[Codebook Init] Loaded centroids with shape {tuple(centroids.shape)}.")
 
     def _linear_schedule(self, target: float, warmup_steps: int) -> float:
         if warmup_steps <= 0:
@@ -544,6 +623,8 @@ class VQVAE(nn.Module):
 
     def _compute_stats(self, indices: Tensor, device: torch.device) -> Tuple[Tensor, Tensor]:
         with torch.no_grad():
+            if self.quantizer is None:
+                return torch.tensor(0.0, device=device), torch.tensor(0.0, device=device)
             usage_inst = torch.bincount(indices.reshape(-1), minlength=self.quantizer.K).float()
             total = usage_inst.sum().clamp_min(1.0)
             probs = usage_inst / total
@@ -560,10 +641,10 @@ class VQVAE(nn.Module):
         h_enc_geo = self.encoder(h_geo, src_key_padding_mask=(~mask) if mask is not None else None)
         h_enc_geo = self.enc_ln(h_enc_geo)
         g = self.ln_geo(h_enc_geo)
-    
+
         ss_onehot = x[..., 3:]
         h_ss = self.ss_input_proj(ss_onehot)
-        h_ss = h_ss + self.pos_enc[:, :L, :]  
+        h_ss = h_ss + self.pos_enc[:, :L, :]
         h_enc_ss = self.ss_encoder(h_ss, src_key_padding_mask=(~mask) if mask is not None else None)
         s = self.ln_ss(h_enc_ss)
         if self.training and self._grad_monitor_enabled and hasattr(self, '_create_grad_hook_func'):
@@ -580,7 +661,7 @@ class VQVAE(nn.Module):
         for hook in self._grad_hooks:
             hook.remove()
         self._grad_hooks.clear()
-        
+
         if enabled:
             print(f"[Grad Monitor] Enabled")
             def create_grad_hook(name):
@@ -589,38 +670,38 @@ class VQVAE(nn.Module):
                         print(f"[GRAD-ERROR] {name}: NaN or Inf detected!")
                     else:
                         grad_norm = grad.norm().item()
-                        if grad_norm > 1e-6:  
+                        if grad_norm > 1e-6:
                             print(f"[GRAD] {name}: norm={grad_norm:.6f}, mean={grad.mean().item():.6f}, std={grad.std().item():.6f}")
                 return hook
-            
+
             self._create_grad_hook_func = create_grad_hook
         else:
             print(f"[Grad Monitor] Disabled")
             self._create_grad_hook_func = None
-            
+
     def print_grad_summary(self):
         if not self.training:
             print("[Grad Summary] Model is in eval mode, no gradients")
             return
-        
+
         total_params = 0
         geo_params = 0
         ss_params = 0
         fusion_params = 0
         vq_params = 0
         decoder_params = 0
-        
+
         geo_grad_norm = 0.0
         ss_grad_norm = 0.0
         fusion_grad_norm = 0.0
         vq_grad_norm = 0.0
         decoder_grad_norm = 0.0
-        
+
         for name, param in self.named_parameters():
             if param.grad is not None:
                 grad_norm = param.grad.norm().item()
                 total_params += 1
-                
+
                 if 'encoder' in name and 'ss_' not in name:
                     geo_params += 1
                     geo_grad_norm += grad_norm
@@ -636,7 +717,7 @@ class VQVAE(nn.Module):
                 elif 'decoder' in name or 'head_ss' in name or 'head_xyz' in name:
                     decoder_params += 1
                     decoder_grad_norm += grad_norm
-        
+
         print(f"[Grad Summary] Total params with grad: {total_params}")
         if geo_params > 0:
             print(f"  Geo branch: {geo_params} params, avg_grad_norm={geo_grad_norm/max(geo_params,1):.6f}")
@@ -679,7 +760,7 @@ class VQVAE(nn.Module):
 
     def forward(self, x: Tensor, mask: Optional[Tensor] = None, **kwargs) -> List[Tensor]:
         if self.training and hasattr(self, 'training_steps'):
-            if self.training_steps % 5000 == 0:  
+            if self.training_steps % 5000 == 0:
                 self.print_grad_summary()
         target = x.clone()
         x_in = x
@@ -705,13 +786,13 @@ class VQVAE(nn.Module):
                 x_in = torch.cat([x_in[..., :3] + noise, x_in[..., 3:]], dim=-1)
 
         # EMA decay schedule
-        if hasattr(self.quantizer, "decay"):
+        if self.quantizer is not None and hasattr(self.quantizer, "decay"):
             if self._ema_decay_override is not None:
                 self.quantizer.decay = float(self._ema_decay_override)
             else:
                 self.quantizer.decay = float(
-                    self._interp_linear(self.ema_decay_start, self.ema_decay_end, 
-                                      self.training_steps, self.ema_decay_warm_steps)
+                    self._interp_linear(self.ema_decay_start, self.ema_decay_end,
+                                        self.training_steps, self.ema_decay_warm_steps)
                 )
 
         h_fuse_tokens, h_enc_geo, h_ss_tokens = self.encode(x_in, mask=mask)
@@ -722,71 +803,92 @@ class VQVAE(nn.Module):
 
         eta, tau = 0.0, 0.0
 
-        if not self.use_vq:
+        if not self.use_vq or self.quantizer is None:
             z_for_decode = z_e_tokens
             z_q_raw = z_e_tokens
-            indices = torch.zeros(z_e_tokens.size(0), z_e_tokens.size(1), dtype=torch.long, device=z_e_tokens.device)
+            indices = torch.zeros(
+                z_e_tokens.size(0),
+                z_e_tokens.size(1),
+                dtype=torch.long,
+                device=z_e_tokens.device,
+            )
             ppl = torch.tensor(0.0, device=x_in.device)
             dead = torch.tensor(0.0, device=x_in.device)
+
         else:
             do_ema_update = self.training and (self.training_steps >= self.ema_update_freeze_steps)
-            
-            if self.soft_vq_use and self.training:
+
+            # Soft VQ only for single-level quantizer
+            if self.soft_vq_use and self.training and not self.residual_vq:
                 Bsz, Ntok, Ddim = z_e_tokens.shape
                 flat_ze = z_e_tokens.reshape(-1, Ddim)
-                
+
                 with torch.no_grad():
                     emb = self.quantizer.embedding
-                
-                tau = self._interp_linear(self.soft_vq_tau_start, self.soft_vq_tau_end, 
-                                        self.training_steps, self.soft_vq_tau_warm_steps)
-                
-                diff = flat_ze.unsqueeze(1) - emb.unsqueeze(0)  
-                d2 = (diff * diff).sum(dim=-1)                  
-                logits = -d2 / max(1e-8, tau)                   
+
+                tau = self._interp_linear(self.soft_vq_tau_start, self.soft_vq_tau_end,
+                                          self.training_steps, self.soft_vq_tau_warm_steps)
+
+                diff = flat_ze.unsqueeze(1) - emb.unsqueeze(0)
+                d2 = (diff * diff).sum(dim=-1)
+                logits = -d2 / max(1e-8, tau)
                 probs = F.softmax(logits, dim=-1)
-                
+
                 z_soft = (probs @ emb).view(Bsz, Ntok, Ddim)
-                
+
                 with torch.no_grad():
-                    indices = torch.argmin(d2, dim=1)
-                    z_q_hard = F.embedding(indices, emb).view(Bsz, Ntok, Ddim)
-                
+                    indices_flat = torch.argmin(d2, dim=1)
+                    z_q_hard = F.embedding(indices_flat, emb).view(Bsz, Ntok, Ddim)
+
                 alpha = self._linear_schedule(1.0, self.soft_vq_alpha_warm_steps)
-                
+
                 z_q_mix = (1 - alpha) * z_soft + alpha * z_q_hard
-                z_for_decode = z_e_tokens + (z_q_mix - z_e_tokens).detach()  
+                z_for_decode = z_e_tokens + (z_q_mix - z_e_tokens).detach()
                 z_q_raw = z_q_hard
-                
+
                 do_ema_update = do_ema_update and (alpha >= 0)
-                
+
                 if self.training and do_ema_update:
-                    self.quantizer._ema_update(flat_ze.detach(), indices.detach())
-                
-                ppl, dead = self._compute_stats(indices.view(Bsz, Ntok), z_e_tokens.device)
-                
+                    self.quantizer._ema_update(flat_ze.detach(), indices_flat.detach())
+
+                ppl, dead = self._compute_stats(indices_flat.view(Bsz, Ntok), z_e_tokens.device)
+                indices = indices_flat.view(Bsz, Ntok)
+
             else:
+                # Hard VQ (single-level or residual)
                 z_q_st, z_q_raw, indices, stats = self.quantizer(
-                    z_e_tokens, do_ema_update=do_ema_update, allow_reinit=do_ema_update, mask=None
+                    z_e_tokens,
+                    do_ema_update=do_ema_update,
+                    allow_reinit=do_ema_update,
+                    mask=None,
                 )
                 ppl, dead = stats[0], stats[1]
                 z_for_decode = z_q_st
-           
+
             if self.training and do_ema_update:
                 reinit_interval = 500
                 min_steps = max(self.ema_update_freeze_steps, 800)
-                
+
                 if (self.training_steps % reinit_interval == 0) and (self.training_steps >= min_steps):
-                    B, M, D = z_e_tokens.shape
-                    flat = z_e_tokens.reshape(-1, D)
-                    usage_signal = torch.bincount(indices.reshape(-1), minlength=self.quantizer.K).float()
+                    Bsz, M, Ddim = z_e_tokens.shape
+                    flat = z_e_tokens.reshape(-1, Ddim)
+
+                    if indices.dim() == 3:
+                        idx_for_usage = indices.view(Bsz, -1)
+                    else:
+                        idx_for_usage = indices
+
+                    usage_signal = torch.bincount(
+                        idx_for_usage.reshape(-1),
+                        minlength=self.quantizer.K,
+                    ).float()
                     self.quantizer._maybe_reinit_dead_codes(flat.detach(), usage_signal)
 
         recons = self.decode(z_for_decode, mask=mask)
 
         if self.training and self.training_steps % 500 == 0:
-            current_decay = getattr(self.quantizer, 'decay', 0.0)
-            print(f"Step {self.training_steps}: decay={current_decay:.4f}, tau={tau:.4f}, beta={self.quantizer.beta:.4f}, "
+            current_decay = getattr(self.quantizer, 'decay', 0.0) if (self.quantizer is not None and hasattr(self.quantizer, 'decay')) else 0.0
+            print(f"Step {self.training_steps}: decay={current_decay:.4f}, tau={tau:.4f}, beta={self.quantizer.beta if self.quantizer is not None else 0.0:.4f}, "
                   f"ema_frozen={self.training_steps < self.ema_update_freeze_steps}")
 
         vq_pack = (z_q_raw, z_e_tokens, indices, ppl, dead)
@@ -839,7 +941,6 @@ class VQVAE(nn.Module):
         with torch.no_grad():
             a_c, a_mu = VQVAE._center(a_xyz, mask)
             b_c, b_mu = VQVAE._center(b_xyz, mask)
-            # H = A^T @ B
             if mask is None:
                 H = torch.einsum("bli,blj->bij", a_c, b_c)
             else:
@@ -847,18 +948,10 @@ class VQVAE(nn.Module):
                 H = torch.einsum("bli,blj->bij", a_c * m, b_c)
             try:
                 U, S, Vh = torch.linalg.svd(H)
-                
-                # Fix 1: Vh returned by torch.linalg.svd is already V^T
-                # Fix 2: Correct rotation formula R = U @ D @ V^T
-                
-                # Check determinant to handle reflection vs rotation
-                # Note: det(R) = det(U) * det(V^T)
                 det = torch.det(U @ Vh)
-                D = torch.eye(3, device=device).unsqueeze(0).repeat(B, 1, 1)
-                D[:, -1, -1] = (det >= 0).to(D.dtype) * 2.0 - 1.0
-
-                # Correct formula: R = U D V^T
-                R = U @ D @ Vh  
+                Dm = torch.eye(3, device=device).unsqueeze(0).repeat(B, 1, 1)
+                Dm[:, -1, -1] = (det >= 0).to(Dm.dtype) * 2.0 - 1.0
+                R = U @ Dm @ Vh
             except Exception:
                 R = torch.eye(3, device=device).unsqueeze(0).repeat(B, 1, 1)
             t = b_mu - torch.einsum("bli,bij->blj", a_mu, R)
@@ -879,9 +972,9 @@ class VQVAE(nn.Module):
         cnt = 0.0
         for d in offs:
             ai = a_xyz[:, :-d, :]
-            aj = a_xyz[:,  d:, :]
+            aj = a_xyz[:, d:, :]
             bi = b_xyz[:, :-d, :]
-            bj = b_xyz[:,  d:, :]
+            bj = b_xyz[:, d:, :]
             da = (ai - aj).norm(dim=-1)
             db = (bi - bj).norm(dim=-1)
             if mask is not None:
@@ -1027,28 +1120,28 @@ class VQVAE(nn.Module):
         gt_xyz = target[:, :, :3]
         gt_ss_onehot = target[:, :, 3:]
 
-        # Fixed RMSD and alignment calculation
+        # RMSD and alignment calculation
         raw_mse_per_sample = self._mse_per_sample(re_xyz, gt_xyz, mask)
         loss_xyz_raw = raw_mse_per_sample.mean()
-        
+
         aln_mse_per_sample = raw_mse_per_sample
         best_mse_per_sample = raw_mse_per_sample
         loss_xyz_aligned = loss_xyz_raw
         re_aln = re_xyz
-        
+
         try:
             can_align = (re_xyz.size(1) >= 3)
             if mask is not None and can_align:
                 valid_per_sample = mask.sum(dim=1) >= 3
                 can_align = valid_per_sample.any()
-            
+
             if can_align:
                 R, t, ok = self._kabsch_rt_safe(re_xyz, gt_xyz, mask)
-                
+
                 if ok.any():
                     re_aln = self._apply_rt(re_xyz, R, t)
                     aln_mse_per_sample = self._mse_per_sample(re_aln, gt_xyz, mask)
-                    
+
                     if mask is not None:
                         valid_mask = mask.sum(dim=1) >= 3
                         best_mse_per_sample = torch.where(
@@ -1062,9 +1155,9 @@ class VQVAE(nn.Module):
                             torch.minimum(raw_mse_per_sample, aln_mse_per_sample),
                             raw_mse_per_sample
                         )
-                    
+
                     loss_xyz_aligned = best_mse_per_sample.mean()
-                    
+
         except Exception as e:
             if self.training and self.training_steps % 1000 == 0:
                 print(f"Kabsch alignment failed: {e}")
@@ -1075,7 +1168,7 @@ class VQVAE(nn.Module):
         # Independent RMSD evaluation metrics
         with torch.no_grad():
             rmsd_raw = torch.sqrt(raw_mse_per_sample.clamp_min(1e-12)).mean()
-            
+
             if 'best_mse_per_sample' in locals():
                 rmsd_aligned = torch.sqrt(best_mse_per_sample.clamp_min(1e-12)).mean()
             else:
@@ -1118,10 +1211,12 @@ class VQVAE(nn.Module):
         # real coords
         std = self._data_std if self._data_std is not None else None
         mean = self._data_mean if self._data_mean is not None else None
+
         def to_real(x):
             if std is not None:
                 return x * std + (mean if mean is not None else 0.0)
             return x
+
         re_xyz_real = to_real(re_xyz)
         gt_xyz_real = to_real(gt_xyz)
 
@@ -1188,7 +1283,7 @@ class VQVAE(nn.Module):
         geom_loss = bond_len_w * bl + bond_ang_w * ba + dir_weight * dir_loss + dih_weight * dih
 
         # VQ loss
-        if self.use_vq:
+        if self.use_vq and self.quantizer is not None:
             commit = F.mse_loss(zq_raw.detach(), ze_raw)
             vq_loss = self.quantizer.beta * commit
         else:
@@ -1196,9 +1291,9 @@ class VQVAE(nn.Module):
 
         # usage entropy reg
         usage_reg = torch.tensor(0.0, device=recons.device)
-        if self.usage_entropy_lambda > 0.0 and ze_raw.numel() > 0:
-            D = ze_raw.size(-1)
-            flat_ze = ze_raw.reshape(-1, D)
+        if self.usage_entropy_lambda > 0.0 and ze_raw.numel() > 0 and self.quantizer is not None:
+            Ddim = ze_raw.size(-1)
+            flat_ze = ze_raw.reshape(-1, Ddim)
             with torch.no_grad():
                 emb = self.quantizer.embedding.detach()
             logits = flat_ze @ emb.t()
@@ -1292,11 +1387,30 @@ class VQVAE(nn.Module):
 
     @torch.no_grad()
     def sample(self, num_samples: int, device: torch.device, out_len: Optional[int] = None):
+        if not self.use_vq or self.quantizer is None:
+            raise RuntimeError("Quantizer is not initialized for sampling.")
+
         N = int(self.latent_n_tokens)
-        K = int(self.quantizer.K)
-        idx = torch.randint(0, K, (num_samples, N), device=device)
-        z_q = F.embedding(idx, self.quantizer.embedding)
-        L = out_len if (out_len is not None) else self.max_seq_len
-        mask = torch.ones(num_samples, L, dtype=torch.bool, device=device)
+        L_out = out_len if (out_len is not None) else self.max_seq_len
+
+        # Residual VQ sampling: sum embeddings from each level
+        if self.residual_vq and self.num_quantizers > 1:
+            L = self.quantizer.num_quantizers
+            K_per = self.quantizer.K_per
+            z_q_sum = 0.0
+
+            for lvl in range(L):
+                idx = torch.randint(0, K_per, (num_samples, N), device=device)
+                emb_slice = self.quantizer.embedding[lvl * K_per:(lvl + 1) * K_per]
+                z_q_l = F.embedding(idx, emb_slice)
+                z_q_sum = z_q_sum + z_q_l
+
+            z_q = z_q_sum
+        else:
+            K = int(self.quantizer.K)
+            idx = torch.randint(0, K, (num_samples, N), device=device)
+            z_q = F.embedding(idx, self.quantizer.embedding)
+
+        mask = torch.ones(num_samples, L_out, dtype=torch.bool, device=device)
         out = self.decode(z_q, mask=mask)
         return out

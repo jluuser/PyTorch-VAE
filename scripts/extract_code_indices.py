@@ -151,6 +151,50 @@ def _fallback_tokenize(core, features: torch.Tensor, mask: torch.Tensor) -> torc
 
 
 @torch.no_grad()
+def _ensure_batch_first_2d(indices: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """
+    Normalize indices shape to [B, N] with batch_first.
+    Handles 1D / 2D / 3D cases in a robust way.
+    """
+    indices = indices.long()
+    B = mask.size(0)
+
+    if indices.dim() == 2:
+        # Prefer indices[0] == B, otherwise try transpose/reshape
+        if indices.size(0) == B:
+            return indices
+        if indices.size(1) == B:
+            return indices.transpose(0, 1)
+        # fallback: reshape
+        if indices.numel() % B != 0:
+            raise RuntimeError(f"Cannot reshape indices of shape {tuple(indices.shape)} to [B,N] with B={B}")
+        return indices.reshape(B, -1)
+
+    if indices.dim() == 1:
+        # flattened [B * N] or [B]
+        if indices.numel() % B != 0:
+            raise RuntimeError(
+                f"1D indices length {indices.numel()} not divisible by batch size {B}"
+            )
+        N = indices.numel() // B
+        return indices.view(B, N)
+
+    if indices.dim() == 3:
+        # e.g. [B, Q, N] or [Q, B, N] or [B, N, Q]
+        if indices.size(0) == B:
+            return indices.reshape(B, -1)
+        if indices.size(1) == B:
+            return indices.permute(1, 0, 2).reshape(B, -1)
+        if indices.size(2) == B:
+            return indices.permute(2, 0, 1).reshape(B, -1)
+        if indices.numel() % B != 0:
+            raise RuntimeError(f"Cannot reshape 3D indices {tuple(indices.shape)} to [B,N] with B={B}")
+        return indices.reshape(B, -1)
+
+    raise RuntimeError(f"Unsupported indices dim={indices.dim()} with shape {tuple(indices.shape)}")
+
+
+@torch.no_grad()
 def tokenize_and_quantize(core, x: torch.Tensor, mask: torch.Tensor) -> Tuple[torch.Tensor, np.ndarray]:
     dev = next(core.parameters()).device
     x = x.to(dev, non_blocking=True)
@@ -173,9 +217,10 @@ def tokenize_and_quantize(core, x: torch.Tensor, mask: torch.Tensor) -> Tuple[to
         # Try to find a 2D integer tensor as indices
         cand_idx = None
         for item in enc_out:
-            if torch.is_tensor(item) and item.dim() == 2 and item.dtype in (torch.int64, torch.int32):
-                cand_idx = item
-                break
+            if torch.is_tensor(item) and item.dtype in (torch.int64, torch.int32):
+                if item.dim() >= 1:
+                    cand_idx = item
+                    break
         if cand_idx is not None:
             indices = cand_idx.long()
         else:
@@ -196,9 +241,9 @@ def tokenize_and_quantize(core, x: torch.Tensor, mask: torch.Tensor) -> Tuple[to
 
             q_out = q(z_e, do_ema_update=False, allow_reinit=False, mask=None)
             if isinstance(q_out, (tuple, list)) and len(q_out) >= 3:
-                indices = q_out[2].long()
+                indices = q_out[2]
             elif torch.is_tensor(q_out):
-                indices = q_out.long()
+                indices = q_out
             else:
                 raise RuntimeError("Unsupported quantizer output type.")
     else:
@@ -214,11 +259,14 @@ def tokenize_and_quantize(core, x: torch.Tensor, mask: torch.Tensor) -> Tuple[to
 
         q_out = q(z_e, do_ema_update=False, allow_reinit=False, mask=None)
         if isinstance(q_out, (tuple, list)) and len(q_out) >= 3:
-            indices = q_out[2].long()
+            indices = q_out[2]
         elif torch.is_tensor(q_out):
-            indices = q_out.long()
+            indices = q_out
         else:
             raise RuntimeError("Unsupported quantizer output type.")
+
+    # Normalize indices to [B, N] (batch_first)
+    indices = _ensure_batch_first_2d(indices, mask)
 
     lengths = mask.sum(dim=1).long().cpu().numpy()
     return indices, lengths
@@ -290,7 +338,7 @@ def main():
             B, N = indices_bt.shape
 
             if args.expect_latent_len > 0 and N != int(args.expect_latent_len):
-                print(f"[warn] latent_len mismatch: got {N}, expect {args.expect_latent_len}")
+                print(f"[warn][rank{rank}] latent_len mismatch: got {N}, expect {args.expect_latent_len}")
 
             for b in range(B):
                 seq = indices_bt[b].cpu().numpy()

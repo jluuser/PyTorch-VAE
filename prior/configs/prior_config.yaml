@@ -1,18 +1,16 @@
-# Prior over VQ-VAE code indices (fixed N=48)
-
 data:
   train_manifest: "/public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/prior/out_prior_token64_K1024_D512_data/train/manifest.jsonl"
   val_manifest:   "/public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/prior/out_prior_token64_K1024_D512_data/val/manifest.jsonl"
   pad_token_id: null
   bos_token_id: null
   eos_token_id: null
-  max_len: 64                  # latent tokens length N
+  max_len: 256                 # flattened latent length = 64 * 4
   batch_size: 256
   num_workers: 16
-  bucket_boundaries: []        # disable bucketing for fixed length
+  bucket_boundaries: []        # no bucketing for fixed-length
 
 vq:
-  codebook_size: 1024           # fallback if --vq_yaml is not provided
+  codebook_size: 4096          # global vocab size after flattening RVQ
 
 model:
   d_model: 512
@@ -38,7 +36,7 @@ runtime:
   save_interval_updates: 10000
   eval_interval_updates: 500
   grad_accum_steps: 2
-  ckpt_dir: "/public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/prior/prior_ckpts/prior_1_6.pt"
+  ckpt_dir: "/public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/prior/prior_ckpts/prior_1_8.pt"
   device: "cuda"
   dtype: "float32"
   amp: true

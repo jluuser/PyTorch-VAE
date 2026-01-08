@@ -89,15 +89,42 @@ def try_get_codebook_from_prior_cfg(prior_cfg: Dict[str, Any]) -> Optional[int]:
 
 
 def compute_vocab_and_specials(vq_yaml_path: Optional[str], prior_cfg: Dict[str, Any]) -> Tuple[int, int, int, int, int]:
+    """
+    Compute global code vocabulary size K and special tokens (PAD,BOS,EOS,V).
+
+    If vq_yaml_path is provided and model_params.residual_vq is true, we assume:
+      - model_params.codebook_size: codes per level
+      - model_params.num_quantizers: number of levels
+      => K = codebook_size * num_quantizers  (flattened RVQ)
+    Otherwise:
+      - K = model_params.codebook_size
+
+    If vq_yaml_path is not given or missing fields, fallback to prior_cfg.
+    """
     K = None
     if vq_yaml_path:
         vq_cfg = load_yaml(vq_yaml_path)
-        K = vq_cfg.get("model_params", {}).get("codebook_size", None)
+        mp = vq_cfg.get("model_params", {}) or {}
+        if mp.get("residual_vq", False):
+            base_k = mp.get("codebook_size", None)
+            num_q = mp.get("num_quantizers", 1)
+            if base_k is None:
+                raise ValueError("VQ yaml: model_params.codebook_size is required when residual_vq is true.")
+            K = int(base_k) * int(num_q)
+        else:
+            base_k = mp.get("codebook_size", None)
+            if base_k is not None:
+                K = int(base_k)
+
     if K is None:
         K = try_get_codebook_from_prior_cfg(prior_cfg)
+
     if K is None:
-        raise ValueError("codebook_size not found. Provide --vq_yaml with model_params.codebook_size "
-                         "or put codebook_size into prior_cfg.")
+        raise ValueError(
+            "codebook_size not found. Provide --vq_yaml with model_params.codebook_size "
+            "(and num_quantizers if residual_vq), or put global codebook_size into prior_cfg."
+        )
+
     PAD, BOS, EOS = K, K + 1, K + 2
     V = K + 3
     return K, PAD, BOS, EOS, V
@@ -286,6 +313,9 @@ def main():
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+    if get_rank() == 0:
+        print(f"[info] Code vocab K={K}, PAD={PAD}, BOS={BOS}, EOS={EOS}, V={V}")
 
     # data config
     data_cfg = cfg["data"]

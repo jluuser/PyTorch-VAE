@@ -17,7 +17,7 @@ Example:
 python prior/sample_prior.py \
   --prior_ckpt /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/checkpoints/best_prior_ckpts/prior_best.pt \
   --num_samples 300 \
-  --latent_len 48 \
+  --latent_len 256 \
   --min_target_len 64 \
   --target_len 350 \
   --temperature 1.0 \
@@ -26,7 +26,7 @@ python prior/sample_prior.py \
   --indices_dtype int16 \
   --out_dir /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/prior/new_prior_samples_300 \
   --device cuda \
-  --train_manifest /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/prior/out_prior_data/train/manifest.jsonl
+  --train_manifest /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/prior/out_prior_token64_K1024_D512_data/train/manifest.jsonl
 """
 
 # add repo root (PyTorch-VAE) to sys.path
@@ -193,7 +193,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--prior_ckpt", type=str, required=True)
     ap.add_argument("--num_samples", type=int, default=8)
-    ap.add_argument("--latent_len", type=int, default=48)
+    ap.add_argument("--latent_len", type=int, default=256)
 
     ap.add_argument(
         "--min_target_len",
