@@ -141,20 +141,23 @@ def decode_one(core, indices_np: np.ndarray, target_len: int) -> torch.Tensor:
 
     # Fallback: reconstruct z_q from indices and call decode
     z_q = indices_to_latent(core, indices_np)  # [1, N_latent, D]
-    B, L_latent, _ = z_q.shape
+    B = z_q.size(0)
 
-    # build latent mask (all valid)
-    mask = torch.ones(B, L_latent, dtype=torch.bool, device=z_q.device)
+    # [FIX] Use target_len to create the mask
+    # This ensures the decoder generates the correct number of points (L)
+    # instead of the latent length (N).
+    L_target = int(target_len)
+    mask = torch.ones(B, L_target, dtype=torch.bool, device=z_q.device)
 
     # Try various decode signatures
     try:
-        out = core.decode(z_q, mask=mask, target_len=int(target_len))
+        out = core.decode(z_q, mask=mask, target_len=L_target)
     except TypeError:
         try:
             out = core.decode(z_q, mask=mask)
         except TypeError:
             try:
-                out = core.decode(z_q, int(target_len))
+                out = core.decode(z_q, L_target)
             except TypeError:
                 out = core.decode(z_q)
     return out
