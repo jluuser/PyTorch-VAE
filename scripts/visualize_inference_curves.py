@@ -13,8 +13,8 @@ It draws a 3D polyline with segment colors by SS (H/E/C) and saves PNGs.
 
 Usage:
   python /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/scripts/visualize_inference_curves.py \
-  --dir /public/home/zhangyangroup/chengshiz/keyuan.zhou/prp-dataset/test_dataset_50/improved1_curves \
-  --out_dir /public/home/zhangyangroup/chengshiz/keyuan.zhou/prp-dataset/test_dataset_50/improved1_curves/visualizations \
+  --dir /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/prior/new_prior_recons_1_8 \
+  --out_dir /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/prior/new_prior_recons_1_8/visualizations \
   --yaml /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/configs/stage2_vq.yaml
 
 """

@@ -10,7 +10,7 @@ import json
 import argparse
 import hashlib
 from pathlib import Path
-from typing import Tuple, List
+from typing import Tuple, List, Optional
 
 import numpy as np
 import torch
@@ -120,7 +120,7 @@ def build_dataloader(exp, split: str, num_workers: int, pin_memory: bool):
             shuffle=True
         )
         dl = DataLoader(
-            dataset,
+           dataset,
             batch_size=dl.batch_size,
             sampler=sampler,
             num_workers=num_workers if num_workers is not None else dl.num_workers,
@@ -151,36 +151,68 @@ def _fallback_tokenize(core, features: torch.Tensor, mask: torch.Tensor) -> torc
 
 
 @torch.no_grad()
-def _ensure_batch_first_2d(indices: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+def _ensure_batch_first_2d(
+    indices: torch.Tensor,
+    mask: torch.Tensor,
+    num_quantizers: int = 1,
+    latent_tokens: Optional[int] = None,
+) -> torch.Tensor:
     """
     Normalize indices shape to [B, N] with batch_first.
-    Handles 1D / 2D / 3D cases in a robust way.
+
+    For residual VQ (num_quantizers>1) when indices is a 1D flattened tensor,
+    we interpret the original layout from VectorQuantizerEMA as:
+        [level, batch, token] flattened -> [Q * B * M]
+    and we convert it to:
+        [B, M, Q] -> [B, M * Q]
+    where per-sample sequence is:
+        [t0_l0, t0_l1, ..., t0_l(Q-1), t1_l0, t1_l1, ..., t(M-1)_l(Q-1)].
     """
     indices = indices.long()
     B = mask.size(0)
 
+    # Residual VQ: flatten = [Q * B * M] (level-major)
+    if indices.dim() == 1 and num_quantizers > 1:
+        N_flat = indices.numel()
+        base = B * num_quantizers
+        if N_flat % base != 0:
+            raise RuntimeError(
+                f"RVQ indices length {N_flat} not divisible by B*num_quantizers={base}"
+            )
+        M = N_flat // base
+
+        if latent_tokens is not None and M != int(latent_tokens):
+            print(
+                f"[warn] RVQ inferred tokens={M} != latent_tokens={latent_tokens}"
+            )
+
+        # View as [Q, B, M] where each block of B*M belongs to one level
+        idx = indices.view(num_quantizers, B, M)      # [Q, B, M]
+        idx = idx.permute(1, 2, 0).contiguous()       # [B, M, Q]
+        return idx.view(B, M * num_quantizers)        # [B, M*Q]
+
+    # Generic fallbacks for non-RVQ or already-structured indices
     if indices.dim() == 2:
-        # Prefer indices[0] == B, otherwise try transpose/reshape
         if indices.size(0) == B:
             return indices
         if indices.size(1) == B:
             return indices.transpose(0, 1)
-        # fallback: reshape
         if indices.numel() % B != 0:
-            raise RuntimeError(f"Cannot reshape indices of shape {tuple(indices.shape)} to [B,N] with B={B}")
+            raise RuntimeError(
+                f"Cannot reshape indices of shape {tuple(indices.shape)} to [B,N] with B={B}"
+            )
         return indices.reshape(B, -1)
 
     if indices.dim() == 1:
-        # flattened [B * N] or [B]
-        if indices.numel() % B != 0:
+        N_flat = indices.numel()
+        if N_flat % B != 0:
             raise RuntimeError(
-                f"1D indices length {indices.numel()} not divisible by batch size {B}"
+                f"1D indices length {N_flat} not divisible by batch size {B}"
             )
-        N = indices.numel() // B
+        N = N_flat // B
         return indices.view(B, N)
 
     if indices.dim() == 3:
-        # e.g. [B, Q, N] or [Q, B, N] or [B, N, Q]
         if indices.size(0) == B:
             return indices.reshape(B, -1)
         if indices.size(1) == B:
@@ -188,10 +220,14 @@ def _ensure_batch_first_2d(indices: torch.Tensor, mask: torch.Tensor) -> torch.T
         if indices.size(2) == B:
             return indices.permute(2, 0, 1).reshape(B, -1)
         if indices.numel() % B != 0:
-            raise RuntimeError(f"Cannot reshape 3D indices {tuple(indices.shape)} to [B,N] with B={B}")
+            raise RuntimeError(
+                f"Cannot reshape 3D indices {tuple(indices.shape)} to [B,N] with B={B}"
+            )
         return indices.reshape(B, -1)
 
-    raise RuntimeError(f"Unsupported indices dim={indices.dim()} with shape {tuple(indices.shape)}")
+    raise RuntimeError(
+        f"Unsupported indices dim={indices.dim()} with shape {tuple(indices.shape)}"
+    )
 
 
 @torch.no_grad()
@@ -208,13 +244,17 @@ def tokenize_and_quantize(core, x: torch.Tensor, mask: torch.Tensor) -> Tuple[to
     if q is None:
         raise RuntimeError("model.quantizer not found")
 
-    latent_tokens = getattr(core, "latent_tokens", None)
+    # Prefer latent_n_tokens; fallback to latent_tokens if needed
+    latent_tokens = getattr(core, "latent_n_tokens", None)
+    if latent_tokens is None:
+        latent_tokens = getattr(core, "latent_tokens", None)
+
+    num_quantizers = int(getattr(q, "num_quantizers", 1))
 
     indices: torch.Tensor
 
     # Case 1: encode returns tuple/list
     if isinstance(enc_out, (tuple, list)):
-        # Try to find a 2D integer tensor as indices
         cand_idx = None
         for item in enc_out:
             if torch.is_tensor(item) and item.dtype in (torch.int64, torch.int32):
@@ -224,7 +264,6 @@ def tokenize_and_quantize(core, x: torch.Tensor, mask: torch.Tensor) -> Tuple[to
         if cand_idx is not None:
             indices = cand_idx.long()
         else:
-            # assume first tensor is latent features
             if not torch.is_tensor(enc_out[0]):
                 raise RuntimeError("encode() output[0] must be a tensor.")
             feats = enc_out[0]
@@ -232,11 +271,9 @@ def tokenize_and_quantize(core, x: torch.Tensor, mask: torch.Tensor) -> Tuple[to
                 raise RuntimeError("encode()[0] tensor must be [B, T, D].")
             B, T, _ = feats.shape
 
-            # If T == latent_tokens -> already [B,N,D]
             if latent_tokens is not None and T == int(latent_tokens):
                 z_e = feats
             else:
-                # fallback: encoder features [B,L,H]
                 z_e = _fallback_tokenize(core, feats, mask)
 
             q_out = q(z_e, do_ema_update=False, allow_reinit=False, mask=None)
@@ -265,8 +302,13 @@ def tokenize_and_quantize(core, x: torch.Tensor, mask: torch.Tensor) -> Tuple[to
         else:
             raise RuntimeError("Unsupported quantizer output type.")
 
-    # Normalize indices to [B, N] (batch_first)
-    indices = _ensure_batch_first_2d(indices, mask)
+    # Normalize indices to [B, N] (batch_first), with RVQ-aware handling
+    indices = _ensure_batch_first_2d(
+        indices,
+        mask,
+        num_quantizers=num_quantizers,
+        latent_tokens=int(latent_tokens) if latent_tokens is not None else None,
+    )
 
     lengths = mask.sum(dim=1).long().cpu().numpy()
     return indices, lengths
