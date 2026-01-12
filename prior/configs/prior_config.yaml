@@ -1,34 +1,36 @@
 data:
-  train_manifest: "/public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/prior/out_prior_token64_K1024_D512_data/train/manifest.jsonl"
-  val_manifest:   "/public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/prior/out_prior_token64_K1024_D512_data/val/manifest.jsonl"
+  train_manifest: "/public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/prior/out_prior_token64_K1024_D512_Residual_VQ_data/train/manifest.jsonl"
+  val_manifest:   "/public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/prior/out_prior_token64_K1024_D512_Residual_VQ_data/val/manifest.jsonl"
   pad_token_id: null
   bos_token_id: null
   eos_token_id: null
-  max_len: 256                 # flattened latent length = 64 * 4
+  max_len: 256
   batch_size: 256
   num_workers: 16
-  bucket_boundaries: []        # no bucketing for fixed-length
+  bucket_boundaries: []
 
 vq:
-  codebook_size: 4096          # global vocab size after flattening RVQ
+  codebook_size: 4096
 
 model:
-  d_model: 512
-  n_layers: 8
+  d_model: 768
+  n_layers: 10
   n_heads: 8
-  ffw_mult: 4
-  dropout: 0.1
+  ffw_mult: 8
+  dropout: 0.25
   tie_embeddings: true
   layer_norm_eps: 1e-5
+  num_quantizers: 4
+  use_hierarchical_attn: true
 
 optim:
   lr: 1.2e-3
   betas: [0.9, 0.95]
-  weight_decay: 0.01
-  warmup_updates: 1000
-  max_updates: 15000
+  weight_decay: 0.03
+  warmup_updates: 2000
+  max_updates: 20000
   grad_clip_norm: 1.0
-  label_smoothing: 0.0
+  label_smoothing: 0.1
 
 runtime:
   seed: 42
@@ -42,3 +44,5 @@ runtime:
   amp: true
   periodic_save_every: 0
   keep_last_periodic: 2
+  first_eval_at: 4000
+  early_eval_interval_updates: 5000

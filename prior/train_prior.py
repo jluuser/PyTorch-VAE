@@ -2,19 +2,6 @@
 # coding: utf-8
 """
 DDP-capable training script for Transformer Prior over VQ-VAE code indices.
-
-Launch:
-  torchrun --nproc_per_node=4 prior/train_prior.py \
-    --prior_cfg prior/configs/prior_config.yaml \
-    --vq_yaml configs/stage2_vq.yaml
-
-Enhancements:
-- Optional length-bucketed batching (if data.bucket_boundaries is non-empty)
-- Epoch-like progress estimation (steps_per_epoch, approx_epochs)
-- Gradient accumulation via runtime.grad_accum_steps
-- Flexible eval schedule: warm-up then early-eval then regular-eval
-- Logging with elapsed time and ETA
-- Lightweight checkpointing: save best & last; optional periodic saves with cleanup
 """
 
 import os
@@ -40,9 +27,6 @@ from prior.datasets.prior_dataset import PriorIndexDataset, collate_pad, BucketB
 from prior.models.prior_transformer import TransformerPriorLM
 
 
-
-# ---------------------- utils ---------------------- #
-
 def load_yaml(path: str) -> Dict[str, Any]:
     import yaml
     with open(path, "r") as f:
@@ -50,7 +34,6 @@ def load_yaml(path: str) -> Dict[str, Any]:
 
 
 def setup_ddp():
-    """Initialize DDP if torchrun env vars present."""
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
         rank = int(os.environ["RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
@@ -88,20 +71,30 @@ def try_get_codebook_from_prior_cfg(prior_cfg: Dict[str, Any]) -> Optional[int]:
     return None
 
 
-def compute_vocab_and_specials(vq_yaml_path: Optional[str], prior_cfg: Dict[str, Any]) -> Tuple[int, int, int, int, int]:
+def try_get_num_quantizers_from_prior_cfg(prior_cfg: Dict[str, Any]) -> Optional[int]:
+    for k1 in ["model", "vq", "model_params"]:
+        node = prior_cfg.get(k1, {})
+        if isinstance(node, dict) and "num_quantizers" in node:
+            return int(node["num_quantizers"])
+    if "num_quantizers" in prior_cfg:
+        return int(prior_cfg["num_quantizers"])
+    return None
+
+
+def compute_vocab_and_specials(
+    vq_yaml_path: Optional[str],
+    prior_cfg: Dict[str, Any],
+) -> Tuple[int, int, int, int, int, int]:
     """
-    Compute global code vocabulary size K and special tokens (PAD,BOS,EOS,V).
-
-    If vq_yaml_path is provided and model_params.residual_vq is true, we assume:
-      - model_params.codebook_size: codes per level
-      - model_params.num_quantizers: number of levels
-      => K = codebook_size * num_quantizers  (flattened RVQ)
-    Otherwise:
-      - K = model_params.codebook_size
-
-    If vq_yaml_path is not given or missing fields, fallback to prior_cfg.
+    Returns:
+      K: number of code tokens (flattened RVQ codes)
+      PAD, BOS, EOS: special token ids
+      V: total vocab size (K + 3)
+      num_q: number of quantizers (RVQ levels)
     """
     K = None
+    num_q = None
+
     if vq_yaml_path:
         vq_cfg = load_yaml(vq_yaml_path)
         mp = vq_cfg.get("model_params", {}) or {}
@@ -111,13 +104,18 @@ def compute_vocab_and_specials(vq_yaml_path: Optional[str], prior_cfg: Dict[str,
             if base_k is None:
                 raise ValueError("VQ yaml: model_params.codebook_size is required when residual_vq is true.")
             K = int(base_k) * int(num_q)
+            num_q = int(num_q)
         else:
             base_k = mp.get("codebook_size", None)
             if base_k is not None:
                 K = int(base_k)
+            num_q = 1
 
     if K is None:
         K = try_get_codebook_from_prior_cfg(prior_cfg)
+
+    if num_q is None:
+        num_q = try_get_num_quantizers_from_prior_cfg(prior_cfg)
 
     if K is None:
         raise ValueError(
@@ -125,9 +123,12 @@ def compute_vocab_and_specials(vq_yaml_path: Optional[str], prior_cfg: Dict[str,
             "(and num_quantizers if residual_vq), or put global codebook_size into prior_cfg."
         )
 
-    PAD, BOS, EOS = K, K + 1, K + 2
-    V = K + 3
-    return K, PAD, BOS, EOS, V
+    if num_q is None:
+        num_q = 1
+
+    PAD, BOS, EOS = int(K), int(K + 1), int(K + 2)
+    V = int(K + 3)
+    return int(K), PAD, BOS, EOS, V, int(num_q)
 
 
 def lr_lambda_builder(warmup_updates: int, max_updates: int):
@@ -224,16 +225,19 @@ def build_loader_bucketed(
 
 
 def set_epoch_if_possible(sampler, epoch: int):
-    if sampler is not None:
-        if hasattr(sampler, "set_epoch") and callable(sampler.set_epoch):
-            sampler.set_epoch(epoch)
+    if sampler is not None and hasattr(sampler, "set_epoch") and callable(sampler.set_epoch):
+        sampler.set_epoch(epoch)
 
-
-# ---------------------- eval & ckpt ---------------------- #
 
 @torch.no_grad()
-def evaluate(model: TransformerPriorLM, loader: DataLoader, sampler,
-             pad_id: int, device: torch.device, amp: bool) -> float:
+def evaluate(
+    model: TransformerPriorLM,
+    loader: DataLoader,
+    sampler,
+    pad_id: int,
+    device: torch.device,
+    amp: bool,
+) -> float:
     model.eval()
     set_epoch_if_possible(sampler, 0)
 
@@ -247,11 +251,12 @@ def evaluate(model: TransformerPriorLM, loader: DataLoader, sampler,
 
         with autocast(enabled=amp):
             logits = model(inp, attn_mask=attn)
-            loss = model.loss(logits, tgt, ignore_index=pad_id)
+            # Use no label smoothing for validation
+            loss = model.loss(logits, tgt, ignore_index=pad_id, label_smoothing=0.0)
 
         tok = (tgt != pad_id).sum().item()
-        sum_loss_times_tokens += loss.item() * max(1, tok)
-        sum_tokens += tok
+        sum_loss_times_tokens += float(loss.item()) * max(1, tok)
+        sum_tokens += int(tok)
 
     if is_dist():
         t = torch.tensor([sum_loss_times_tokens, float(sum_tokens)], device=device)
@@ -263,16 +268,25 @@ def evaluate(model: TransformerPriorLM, loader: DataLoader, sampler,
     return sum_loss_times_tokens / max(1, sum_tokens)
 
 
-def save_ckpt(save_dir: str, name: str, model: TransformerPriorLM,
-              cfg: Dict[str, Any], specials: Dict[str, int], step: int):
+def save_ckpt(
+    save_dir: str,
+    name: str,
+    model: TransformerPriorLM,
+    cfg: Dict[str, Any],
+    specials: Dict[str, int],
+    step: int,
+):
     os.makedirs(save_dir, exist_ok=True)
     path = os.path.join(save_dir, name)
-    torch.save({
-        "model": model.state_dict(),
-        "cfg": cfg,
-        "special_tokens": specials,
-        "global_step": step
-    }, path)
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "cfg": cfg,
+            "special_tokens": specials,
+            "global_step": step,
+        },
+        path,
+    )
     return path
 
 
@@ -287,18 +301,15 @@ def cleanup_old_checkpoints(ckpt_dir: str, keep_last_n: int = 2):
                 pass
 
 
-# ---------------------- main ---------------------- #
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--prior_cfg", type=str, required=True, help="Path to prior/configs/prior_config.yaml")
-    ap.add_argument("--vq_yaml", type=str, default="", help="Path to VQ-VAE yaml (to read codebook_size)")
+    ap.add_argument("--vq_yaml", type=str, default="", help="Path to VQ-VAE yaml (to read codebook_size/num_quantizers)")
     ap.add_argument("--resume", type=str, default="", help="Optional: path to prior checkpoint to resume from")
     args = ap.parse_args()
 
-    rank, world = setup_ddp()
+    setup_ddp()
 
-    # device / local rank
     if torch.cuda.is_available():
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         torch.cuda.set_device(local_rank)
@@ -307,7 +318,9 @@ def main():
         device = torch.device("cpu")
 
     cfg = load_yaml(args.prior_cfg)
-    K, PAD, BOS, EOS, V = compute_vocab_and_specials(args.vq_yaml if args.vq_yaml else None, cfg)
+    K, PAD, BOS, EOS, V, num_q = compute_vocab_and_specials(
+        args.vq_yaml if args.vq_yaml else None, cfg
+    )
 
     seed = int(cfg["runtime"].get("seed", 42))
     torch.manual_seed(seed)
@@ -315,9 +328,8 @@ def main():
         torch.cuda.manual_seed_all(seed)
 
     if get_rank() == 0:
-        print(f"[info] Code vocab K={K}, PAD={PAD}, BOS={BOS}, EOS={EOS}, V={V}")
+        print(f"[info] Code vocab K={K}, PAD={PAD}, BOS={BOS}, EOS={EOS}, V={V}, num_q={num_q}")
 
-    # data config
     data_cfg = cfg["data"]
     batch_size = int(data_cfg["batch_size"])
     num_workers = int(data_cfg["num_workers"])
@@ -326,7 +338,6 @@ def main():
     drop_last = False
     boundaries = data_cfg.get("bucket_boundaries", []) or []
 
-    # choose sampler mode
     use_bucket = len(boundaries) > 0
 
     if use_bucket:
@@ -380,52 +391,57 @@ def main():
             is_train=False
         )
 
-    # rough epoch estimation
-    steps_per_epoch = (len(train_ds) + (batch_size * max(1, world) - 1)) // (batch_size * max(1, world))
+    steps_per_epoch = (len(train_ds) + (batch_size * max(1, get_world_size()) - 1)) // (
+        batch_size * max(1, get_world_size())
+    )
     approx_epochs = (int(cfg["optim"]["max_updates"]) + steps_per_epoch - 1) // max(1, steps_per_epoch)
     if get_rank() == 0:
         mode = "Bucketed" if use_bucket else "Distributed"
         print(f"[info] Sampler mode: {mode}")
         print(f"[info] Train samples: {len(train_ds)} | Val samples: {len(val_ds)}")
-        print(f"[info] Batch size: {batch_size} per GPU | World size: {world}")
+        print(f"[info] Batch size: {batch_size} per GPU | World size: {get_world_size()}")
         print(f"[info] Steps/epoch ~= {steps_per_epoch} | Planned epochs ~= {approx_epochs}")
 
-    # model
+    model_cfg = cfg.get("model", {}) or {}
+    use_hier = bool(model_cfg.get("use_hierarchical_attn", True))
+    label_smoothing = float(cfg.get("optim", {}).get("label_smoothing", 0.0))
+
     model = TransformerPriorLM(
         vocab_size=V,
-        d_model=int(cfg["model"]["d_model"]),
-        n_layers=int(cfg["model"]["n_layers"]),
-        n_heads=int(cfg["model"]["n_heads"]),
-        ffw_mult=int(cfg["model"]["ffw_mult"]),
-        dropout=float(cfg["model"]["dropout"]),
-        tie_embeddings=bool(cfg["model"]["tie_embeddings"]),
-        layer_norm_eps=float(cfg["model"]["layer_norm_eps"]),
-        pad_token_id=PAD
+        d_model=int(model_cfg["d_model"]),
+        n_layers=int(model_cfg["n_layers"]),
+        n_heads=int(model_cfg["n_heads"]),
+        ffw_mult=int(model_cfg["ffw_mult"]),
+        dropout=float(model_cfg["dropout"]),
+        max_code_len=max_len,
+        num_quantizers=int(model_cfg.get("num_quantizers", num_q)),
+        tie_embeddings=bool(model_cfg.get("tie_embeddings", True)),
+        layer_norm_eps=float(model_cfg.get("layer_norm_eps", 1e-5)),
+        use_hierarchical_attn=use_hier,
+        pad_token_id=PAD,
     ).to(device)
 
-    # optimizer / scheduler / amp
     opt = AdamW(
         model.parameters(),
         lr=float(cfg["optim"]["lr"]),
         betas=tuple(cfg["optim"]["betas"]),
         weight_decay=float(cfg["optim"]["weight_decay"])
     )
+    max_updates = int(cfg["optim"]["max_updates"])
     lr_lambda = lr_lambda_builder(
         warmup_updates=int(cfg["optim"]["warmup_updates"]),
-        max_updates=int(cfg["optim"]["max_updates"])
+        max_updates=max_updates
     )
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
 
     scaler = GradScaler(enabled=bool(cfg["runtime"]["amp"]))
     grad_clip = float(cfg["optim"]["grad_clip_norm"])
     log_interval = int(cfg["runtime"]["log_interval"])
-    save_interval = int(cfg["runtime"]["save_interval_updates"])  # reserved if you later want to use it
     eval_interval_default = int(cfg["runtime"].get("eval_interval_updates", 10000))
     ckpt_dir = str(cfg["runtime"]["ckpt_dir"])
     amp_flag = bool(cfg["runtime"]["amp"])
     grad_accum = int(cfg["runtime"].get("grad_accum_steps", 1))
 
-    # eval schedule controls
     first_eval_at = int(cfg["runtime"].get("first_eval_at", 4000))
     early_eval_interval = int(cfg["runtime"].get("early_eval_interval_updates", 5000))
     late_eval_interval = eval_interval_default
@@ -436,11 +452,9 @@ def main():
         interval = early_eval_interval if step < (first_eval_at * 2) else late_eval_interval
         return (step % interval) == 0 or (step == max_updates)
 
-    # optional periodic saving (disabled by default)
-    periodic_every = int(cfg["runtime"].get("periodic_save_every", 0))  # 0 = disabled
+    periodic_every = int(cfg["runtime"].get("periodic_save_every", 0))
     keep_last_periodic = int(cfg["runtime"].get("keep_last_periodic", 2))
 
-    # resume
     global_step = 0
     if args.resume:
         ckpt = torch.load(args.resume, map_location="cpu")
@@ -449,14 +463,18 @@ def main():
         if get_rank() == 0:
             print(f"[resume] loaded {args.resume} at step {global_step}")
 
-    specials = {"K": K, "PAD": PAD, "BOS": BOS, "EOS": EOS, "V": V}
+    specials = {
+        "K": K,
+        "PAD": PAD,
+        "BOS": BOS,
+        "EOS": EOS,
+        "V": V,
+        "num_quantizers": int(model_cfg.get("num_quantizers", num_q)),
+    }
     best_val_nll = float("inf")
 
-    # training loop
     epoch = 0
     model.train()
-    max_updates = int(cfg["optim"]["max_updates"])
-
     accum_loss = 0.0
     accum_count = 0
 
@@ -482,10 +500,16 @@ def main():
 
             with autocast(enabled=amp_flag):
                 logits = model(inp, attn_mask=attn)
-                loss = model.loss(logits, tgt, ignore_index=PAD) / max(1, grad_accum)
+                loss_raw = model.loss(
+                    logits,
+                    tgt,
+                    ignore_index=PAD,
+                    label_smoothing=label_smoothing,
+                )
+                loss = loss_raw / max(1, grad_accum)
 
             scaler.scale(loss).backward()
-            accum_loss += float(loss.item())
+            accum_loss += float(loss_raw.item())
             accum_count += 1
 
             if ((step_in_epoch + 1) % grad_accum) == 0:
@@ -500,7 +524,6 @@ def main():
                 update_times.append(now - last_update_ts)
                 last_update_ts = now
 
-                # logging (rank0)
                 if (global_step % log_interval == 0) and (get_rank() == 0):
                     avg_nll = accum_loss / max(1, accum_count)
                     ppl = math.exp(min(20.0, avg_nll))
@@ -516,29 +539,42 @@ def main():
                     accum_loss = 0.0
                     accum_count = 0
 
-                # eval (rank0 save best/periodic)
                 if should_eval(global_step):
                     val_nll = evaluate(model, val_loader, val_sampler, PAD, device, amp=amp_flag)
                     if get_rank() == 0:
                         improved = val_nll < best_val_nll
                         if improved:
                             best_val_nll = val_nll
-                            best_path = save_ckpt(ckpt_dir, "prior_best.pt", model, cfg, specials, global_step)
-                            print(f"[eval] step {global_step} | val_nll {val_nll:.4f} | best {best_val_nll:.4f} | saved {best_path}")
+                            best_path = save_ckpt(
+                                ckpt_dir,
+                                "prior_best.pt",
+                                model,
+                                cfg,
+                                specials,
+                                global_step,
+                            )
+                            print(
+                                f"[eval] step {global_step} | val_nll {val_nll:.4f} | best {best_val_nll:.4f} | saved {best_path}"
+                            )
                         else:
-                            print(f"[eval] step {global_step} | val_nll {val_nll:.4f} | best {best_val_nll:.4f}")
+                            print(
+                                f"[eval] step {global_step} | val_nll {val_nll:.4f} | best {best_val_nll:.4f}"
+                            )
 
                         if periodic_every > 0 and (global_step % periodic_every == 0):
                             p_path = save_ckpt(
-                                ckpt_dir, f"prior_step{global_step}_nll{val_nll:.4f}.pt",
-                                model, cfg, specials, global_step
+                                ckpt_dir,
+                                f"prior_step{global_step}_nll{val_nll:.4f}.pt",
+                                model,
+                                cfg,
+                                specials,
+                                global_step,
                             )
                             cleanup_old_checkpoints(ckpt_dir, keep_last_n=keep_last_periodic)
                             print(f"[periodic] saved {p_path} (keep last {keep_last_periodic})")
 
         epoch += 1
 
-    # final save (rank0)
     if get_rank() == 0:
         last_path = save_ckpt(ckpt_dir, "prior_last.pt", model, cfg, specials, global_step)
         print(f"[final] saved {last_path} at step {global_step}")
