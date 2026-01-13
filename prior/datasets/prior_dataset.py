@@ -30,6 +30,8 @@ class PriorIndexDataset(Dataset):
     Notes:
       - We trust 'length' in manifest if present to avoid pre-loading for length queries.
       - max_len applies to the raw sequence length L BEFORE adding BOS/EOS; so effective len is <= max_len+1.
+      - If geo_path is present in manifest, an additional float feature "geo" is returned
+        with shape [T, D_geo], aligned to inp.
     """
 
     def __init__(
@@ -57,9 +59,9 @@ class PriorIndexDataset(Dataset):
                 if not line:
                     continue
                 rec = json.loads(line)
-                # normalize fields
                 rec["indices_path"] = str(rec["indices_path"])
-                # prefer explicit length if present; otherwise, allow latent_len as a hint
+                if "geo_path" in rec:
+                    rec["geo_path"] = str(rec["geo_path"])
                 if "length" in rec:
                     rec["length"] = int(rec["length"])
                 elif "latent_len" in rec:
@@ -68,6 +70,21 @@ class PriorIndexDataset(Dataset):
 
         if len(self.records) == 0:
             raise ValueError(f"manifest is empty: {manifest_path}")
+
+        self.has_geo: bool = "geo_path" in self.records[0]
+        self.geo_dim: Optional[int] = None
+        if self.has_geo:
+            geo_path0 = self.records[0]["geo_path"]
+            try:
+                g0 = np.load(geo_path0, allow_pickle=False)
+                if g0.ndim == 2:
+                    self.geo_dim = int(g0.shape[1])
+                else:
+                    self.geo_dim = None
+                    self.has_geo = False
+            except Exception:
+                self.geo_dim = None
+                self.has_geo = False
 
     def __len__(self) -> int:
         return len(self.records)
@@ -78,8 +95,13 @@ class PriorIndexDataset(Dataset):
             raise ValueError(f"indices must be 1D array, got shape {arr.shape} at {npy_path}")
         if self.strict_dtype and arr.dtype not in (np.int16, np.int32, np.int64):
             raise TypeError(f"indices dtype must be int, got {arr.dtype} at {npy_path}")
-        # use int64 for PyTorch
         return arr.astype(np.int64, copy=False)
+
+    def _load_geo(self, npy_path: str) -> np.ndarray:
+        arr = np.load(npy_path, allow_pickle=False)
+        if arr.ndim != 2:
+            raise ValueError(f"geo must be 2D array, got shape {arr.shape} at {npy_path}")
+        return arr.astype(np.float32, copy=False)
 
     def raw_length(self, idx: int) -> int:
         """
@@ -88,36 +110,44 @@ class PriorIndexDataset(Dataset):
         rec = self.records[idx]
         if "length" in rec:
             return int(rec["length"])
-        # fallback: load file to query length (slower; should rarely happen)
         arr = self._load_indices(rec["indices_path"])
         return int(arr.shape[0])
 
     def effective_length(self, idx: int) -> int:
         """
         Effective training length after clipping and adding BOS/EOS.
-        We add exactly one token (BOS or EOS), so length becomes min(L, max_len) + 1.
+        We add exactly one token (BOS or EOS), so length becomes min(L, self.max_len) + 1.
         """
         L = self.raw_length(idx)
         return min(L, self.max_len) + 1
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         rec = self.records[idx]
-        seq = self._load_indices(rec["indices_path"])  # int64 [L]
+        seq = self._load_indices(rec["indices_path"])  # [L]
 
-        # truncate raw seq to max_len
         if seq.shape[0] > self.max_len:
             seq = seq[: self.max_len]
 
-        # inp = [BOS, z1..zL]
-        # tgt = [z1..zL, EOS]
         inp = np.concatenate(([self.bos_id], seq), axis=0)
         tgt = np.concatenate((seq, [self.eos_id]), axis=0)
 
-        item = {
-            "inp": torch.from_numpy(inp.astype(np.int64, copy=False)),  # [T]
-            "tgt": torch.from_numpy(tgt.astype(np.int64, copy=False)),  # [T]
+        item: Dict[str, Any] = {
+            "inp": torch.from_numpy(inp.astype(np.int64, copy=False)),
+            "tgt": torch.from_numpy(tgt.astype(np.int64, copy=False)),
         }
-        # optional returns
+
+        if self.has_geo and "geo_path" in rec:
+            geo = self._load_geo(rec["geo_path"])  # [L_geo, D_geo]
+            L_codes = seq.shape[0]
+            if geo.shape[0] > L_codes:
+                geo = geo[:L_codes]
+            elif geo.shape[0] < L_codes:
+                pad_rows = np.zeros((L_codes - geo.shape[0], geo.shape[1]), dtype=geo.dtype)
+                geo = np.concatenate([geo, pad_rows], axis=0)
+            bos_geo = np.zeros((1, geo.shape[1]), dtype=geo.dtype)
+            geo_seq = np.concatenate([bos_geo, geo], axis=0)  # [T, D_geo]
+            item["geo"] = torch.from_numpy(geo_seq.astype(np.float32, copy=False))
+
         if "id" in rec:
             item["id"] = rec["id"]
         if "rank" in rec:
@@ -129,11 +159,12 @@ def collate_pad(batch: List[Dict[str, torch.Tensor]], pad_id: int) -> Dict[str, 
     """
     Pad variable-length sequences to the max length in batch.
     Inputs:
-      - batch: list of dicts with keys 'inp' [T], 'tgt' [T]
+      - batch: list of dicts with keys 'inp' [T], 'tgt' [T], optional 'geo' [T, D_geo]
     Returns:
       - inp: LongTensor [B, T_max]
       - tgt: LongTensor [B, T_max]
       - attn_mask: BoolTensor [B, T_max] (True=valid)
+      - geo: optional FloatTensor [B, T_max, D_geo]
     """
     if len(batch) == 0:
         raise ValueError("Empty batch.")
@@ -145,45 +176,40 @@ def collate_pad(batch: List[Dict[str, torch.Tensor]], pad_id: int) -> Dict[str, 
     tgt_pad = torch.full((B, max_len), int(pad_id), dtype=torch.long)
     attn_mask = torch.zeros((B, max_len), dtype=torch.bool)
 
+    has_geo = "geo" in batch[0]
+    geo_pad: Optional[torch.Tensor] = None
+    if has_geo:
+        D_geo = batch[0]["geo"].size(-1)
+        geo_pad = torch.zeros((B, max_len, D_geo), dtype=torch.float32)
+
     for i, ex in enumerate(batch):
         T = ex["inp"].numel()
         inp_pad[i, :T] = ex["inp"]
         tgt_pad[i, :T] = ex["tgt"]
         attn_mask[i, :T] = True
+        if has_geo and "geo" in ex:
+            g = ex["geo"]
+            if g.size(0) != T:
+                if g.size(0) < T:
+                    pad_rows = torch.zeros((T - g.size(0), g.size(1)), dtype=g.dtype)
+                    g = torch.cat([g, pad_rows], dim=0)
+                else:
+                    g = g[:T]
+            geo_pad[i, :T, :] = g
 
-    return {"inp": inp_pad, "tgt": tgt_pad, "attn_mask": attn_mask}
+    out: Dict[str, torch.Tensor] = {
+        "inp": inp_pad,
+        "tgt": tgt_pad,
+        "attn_mask": attn_mask,
+    }
+    if has_geo and geo_pad is not None:
+        out["geo"] = geo_pad
+    return out
 
-
-# ------------------------ Optional: length-aware bucketed batching ------------------------ #
 
 class BucketBatchSampler(Sampler[List[int]]):
     """
     Length-aware bucketed batch sampler with optional distributed sharding.
-
-    - Buckets are defined by 'boundaries', e.g. [64,128,192,256,320,384,448]
-      where lengths are dataset.effective_length(i).
-    - Within each bucket we shuffle indices and then pack into batches.
-    - Supports:
-        * world_size / rank sharding (for torch.distributed)
-        * .set_epoch(epoch) to reshuffle deterministically per epoch
-
-    Usage:
-        ds = PriorIndexDataset(...)
-        sampler = BucketBatchSampler(
-            dataset=ds,
-            batch_size=64,
-            boundaries=[64,128,192,256,320,384,448],
-            seed=42,
-            shuffle=True,
-            drop_last=False,
-            world_size=dist.get_world_size() if dist.is_initialized() else 1,
-            rank=dist.get_rank() if dist.is_initialized() else 0,
-        )
-        loader = DataLoader(ds, batch_sampler=sampler, collate_fn=lambda b: collate_pad(b, pad_id))
-
-    Notes:
-      - This sampler yields lists of indices (batches). Use as DataLoader(..., batch_sampler=...).
-      - If you use this, DO NOT also set DataLoader(..., sampler=...) at the same time.
     """
 
     def __init__(
@@ -207,11 +233,8 @@ class BucketBatchSampler(Sampler[List[int]]):
         self.world_size = max(1, int(world_size))
         self.rank = max(0, int(rank))
 
-        # Pre-assign indices into buckets by effective length
         self._buckets: List[List[int]] = [[] for _ in range(len(self.boundaries) + 1)]
         self._assign_buckets()
-
-        # epoch affects RNG
         self._epoch = 0
 
     def _assign_buckets(self):
@@ -227,26 +250,20 @@ class BucketBatchSampler(Sampler[List[int]]):
         self._epoch = int(epoch)
 
     def __len__(self) -> int:
-        # Number of batches that THIS rank will yield
-        # Compute total batches across all buckets, then divide by world_size (ceil/division depends on drop_last)
         total = 0
         for bucket in self._buckets:
             n = len(bucket)
             if self.shuffle:
-                # approximate number of batches per bucket
                 nb = n // self.batch_size if self.drop_last else (n + self.batch_size - 1) // self.batch_size
             else:
                 nb = n // self.batch_size if self.drop_last else (n + self.batch_size - 1) // self.batch_size
             total += nb
-        # shard across ranks as evenly as possible
         return (total + self.world_size - 1 - self.rank) // self.world_size
 
     def __iter__(self) -> Iterator[List[int]]:
         g = torch.Generator()
-        # Different global seed per epoch
         g.manual_seed(self.seed + self._epoch)
 
-        # Prepare batches bucket by bucket
         all_batches: List[List[int]] = []
         for bucket in self._buckets:
             if len(bucket) == 0:
@@ -255,22 +272,18 @@ class BucketBatchSampler(Sampler[List[int]]):
                 idx_tensor = torch.tensor(bucket, dtype=torch.long)
                 perm = torch.randperm(len(idx_tensor), generator=g)
                 bucket = idx_tensor[perm].tolist()
-            # chunk into batches
             for i in range(0, len(bucket), self.batch_size):
                 chunk = bucket[i : i + self.batch_size]
                 if len(chunk) < self.batch_size and self.drop_last:
                     continue
                 all_batches.append(chunk)
 
-        # Optionally shuffle the list of batches (to mix buckets)
         if self.shuffle and len(all_batches) > 1:
             idx = torch.randperm(len(all_batches), generator=g).tolist()
             all_batches = [all_batches[i] for i in idx]
 
-        # Distributed sharding over batches (NOT over samples)
         if self.world_size > 1:
             all_batches = all_batches[self.rank :: self.world_size]
 
-        # Yield
         for b in all_batches:
             yield b

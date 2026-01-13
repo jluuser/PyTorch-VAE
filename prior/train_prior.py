@@ -251,7 +251,6 @@ def evaluate(
 
         with autocast(enabled=amp):
             logits = model(inp, attn_mask=attn)
-            # Use no label smoothing for validation
             loss = model.loss(logits, tgt, ignore_index=pad_id, label_smoothing=0.0)
 
         tok = (tgt != pad_id).sum().item()
@@ -405,6 +404,8 @@ def main():
     model_cfg = cfg.get("model", {}) or {}
     use_hier = bool(model_cfg.get("use_hierarchical_attn", True))
     label_smoothing = float(cfg.get("optim", {}).get("label_smoothing", 0.0))
+    geo_dim = int(model_cfg.get("geo_dim", 0))
+    geo_weight = float(cfg.get("optim", {}).get("geo_weight", 0.0))
 
     model = TransformerPriorLM(
         vocab_size=V,
@@ -419,6 +420,7 @@ def main():
         layer_norm_eps=float(model_cfg.get("layer_norm_eps", 1e-5)),
         use_hierarchical_attn=use_hier,
         pad_token_id=PAD,
+        geo_dim=geo_dim,
     ).to(device)
 
     opt = AdamW(
@@ -475,7 +477,8 @@ def main():
 
     epoch = 0
     model.train()
-    accum_loss = 0.0
+    accum_lm_loss = 0.0
+    accum_geo_loss = 0.0
     accum_count = 0
 
     start_time = time.time()
@@ -497,19 +500,36 @@ def main():
             inp = batch["inp"].to(device, non_blocking=True)
             tgt = batch["tgt"].to(device, non_blocking=True)
             attn = batch["attn_mask"].to(device, non_blocking=True)
+            geo = batch.get("geo", None)
+            if geo is not None:
+                geo = geo.to(device, non_blocking=True)
 
             with autocast(enabled=amp_flag):
-                logits = model(inp, attn_mask=attn)
-                loss_raw = model.loss(
+                logits, hidden = model.forward_with_hidden(inp, attn_mask=attn)
+                lm_loss = model.loss(
                     logits,
                     tgt,
                     ignore_index=PAD,
                     label_smoothing=label_smoothing,
                 )
-                loss = loss_raw / max(1, grad_accum)
+
+                geo_loss = None
+                if geo is not None and model.geo_head is not None and geo_weight > 0.0:
+                    geo_pred = model.geo_head(hidden)
+                    valid_mask = attn.unsqueeze(-1)
+                    diff = (geo_pred - geo) * valid_mask
+                    denom = valid_mask.sum().clamp_min(1.0)
+                    geo_loss = (diff ** 2).sum() / denom
+                    total_loss = lm_loss + geo_weight * geo_loss
+                else:
+                    total_loss = lm_loss
+
+                loss = total_loss / max(1, grad_accum)
 
             scaler.scale(loss).backward()
-            accum_loss += float(loss_raw.item())
+            accum_lm_loss += float(lm_loss.item())
+            if geo_loss is not None:
+                accum_geo_loss += float(geo_loss.item())
             accum_count += 1
 
             if ((step_in_epoch + 1) % grad_accum) == 0:
@@ -525,18 +545,27 @@ def main():
                 last_update_ts = now
 
                 if (global_step % log_interval == 0) and (get_rank() == 0):
-                    avg_nll = accum_loss / max(1, accum_count)
-                    ppl = math.exp(min(20.0, avg_nll))
+                    avg_lm = accum_lm_loss / max(1, accum_count)
+                    ppl = math.exp(min(20.0, avg_lm))
                     lr_cur = sched.get_last_lr()[0]
                     elapsed = now - start_time
                     avg_update_sec = (sum(update_times) / len(update_times)) if update_times else 0.0
                     remaining_updates = max(0, max_updates - global_step)
                     eta_sec = remaining_updates * avg_update_sec
-                    print(
-                        f"step {global_step} | nll {avg_nll:.4f} | ppl {ppl:.2f} | lr {lr_cur:.6f} | "
-                        f"elapsed {fmt_hms(elapsed)} | eta {fmt_hms(eta_sec)}"
-                    )
-                    accum_loss = 0.0
+                    if accum_geo_loss > 0.0:
+                        avg_geo = accum_geo_loss / max(1, accum_count)
+                        print(
+                            f"step {global_step} | lm_nll {avg_lm:.4f} | geo_loss {avg_geo:.4f} | "
+                            f"ppl {ppl:.2f} | lr {lr_cur:.6f} | "
+                            f"elapsed {fmt_hms(elapsed)} | eta {fmt_hms(eta_sec)}"
+                        )
+                    else:
+                        print(
+                            f"step {global_step} | lm_nll {avg_lm:.4f} | ppl {ppl:.2f} | "
+                            f"lr {lr_cur:.6f} | elapsed {fmt_hms(elapsed)} | eta {fmt_hms(eta_sec)}"
+                        )
+                    accum_lm_loss = 0.0
+                    accum_geo_loss = 0.0
                     accum_count = 0
 
                 if should_eval(global_step):

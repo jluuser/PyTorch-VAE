@@ -69,16 +69,12 @@ def _per_level_sampling_params(
     p = float(base_top_p)
     rp = float(base_repetition_penalty)
 
-    # Heuristic: Decrease temperature for finer levels to reduce high-frequency noise
-    # e.g. L0=1.0 -> L3=0.85
     if t > 0.0:
         t = max(0.5, t - 0.05 * level)
 
-    # Heuristic: Tighten top_p slightly for finer levels
     if 0.0 < p < 1.0:
         p = max(0.8, min(0.99, p - 0.02 * level))
 
-    # Heuristic: Increase repetition penalty for finer levels to prevent local loops
     if rp >= 1.0:
         rp = rp + 0.05 * level
 
@@ -107,10 +103,8 @@ def generate_fixed_len(
     for step in range(int(latent_len)):
         logits = model(tokens, attn_mask=attn)[:, -1, :]
 
-        # Determine current RVQ level
         level = step % max(1, int(num_quantizers))
-        
-        # Apply per-level sampling params
+
         t_l, p_l, rp_l = _per_level_sampling_params(
             level=level,
             num_quantizers=num_quantizers,
@@ -122,29 +116,24 @@ def generate_fixed_len(
         if t_l > 0.0:
             logits = logits / max(float(t_l), 1e-8)
 
-        # Mask special tokens
         logits[:, int(pad_id)] = float("-inf")
         logits[:, int(bos_id)] = float("-inf")
         logits[:, int(eos_id)] = float("-inf")
 
-        # Apply repetition penalty
         if rp_l > 1.0 and tokens.numel() > 0:
             prev = tokens[0].unique()
-            # Exclude specials from penalty
             prev = prev[(prev != int(pad_id)) & (prev != int(bos_id)) & (prev != int(eos_id))]
             if prev.numel() > 0:
                 gathered = logits.index_select(-1, prev)
-                # Apply penalty: multiply if negative logit, divide if positive
                 gathered = torch.where(gathered < 0, gathered * rp_l, gathered / rp_l)
                 logits.scatter_(-1, prev.unsqueeze(0), gathered)
 
-        # Filtering
         logits = model._top_k_top_p_filtering(
-            logits, 
-            top_k=int(top_k), 
+            logits,
+            top_k=int(top_k),
             top_p=float(p_l)
         )
-        
+
         probs = torch.softmax(logits, dim=-1)
         next_tok = torch.multinomial(probs, num_samples=1)
         out_codes.append(int(next_tok.item()))
@@ -279,6 +268,9 @@ def main():
     num_q = int(mcfg.get("num_quantizers", num_q_sp))
     max_code_len = int(dcfg.get("max_len", int(args.latent_len)))
 
+    # NEW: read geo_dim and pass it into the model
+    geo_dim = int(mcfg.get("geo_dim", 0))
+
     model = TransformerPriorLM(
         vocab_size=V,
         d_model=d_model,
@@ -292,6 +284,7 @@ def main():
         layer_norm_eps=layer_norm_eps,
         use_hierarchical_attn=use_hier,
         pad_token_id=PAD,
+        geo_dim=geo_dim,
     )
     model.load_state_dict(ckpt["model"], strict=True)
     model.to(device)
@@ -309,14 +302,12 @@ def main():
     print(f"[info] generating {args.num_samples} samples to {out_dir} ...")
     meta = []
 
-    # Cache base args
     base_temp = float(args.temperature)
     base_p = float(args.top_p)
     base_k = int(args.top_k)
     base_rep = float(args.repetition_penalty)
 
     for i in range(int(args.num_samples)):
-        # Call generate with explicit num_quantizers to enable per-level sampling
         toks = generate_fixed_len(
             model=model,
             latent_len=int(args.latent_len),

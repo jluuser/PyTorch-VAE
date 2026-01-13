@@ -22,6 +22,7 @@ model:
   layer_norm_eps: 1e-5
   num_quantizers: 4
   use_hierarchical_attn: true
+  geo_dim: 10   # 3 center + 3 direction + 3 ss_mean + 1 radius
 
 optim:
   lr: 1.2e-3
@@ -31,6 +32,7 @@ optim:
   max_updates: 20000
   grad_clip_norm: 1.0
   label_smoothing: 0.1
+  geo_weight: 0.05
 
 runtime:
   seed: 42

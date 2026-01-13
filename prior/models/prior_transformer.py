@@ -21,6 +21,7 @@ class PriorModelConfig:
     layer_norm_eps: float = 1e-5
     use_hierarchical_attn: bool = True
     pad_token_id: Optional[int] = None
+    geo_dim: int = 0
 
 
 class TransformerPriorLM(nn.Module):
@@ -44,9 +45,11 @@ class TransformerPriorLM(nn.Module):
 
     Optional hierarchical attention:
         For code positions (t >= 1), a lower level cannot attend to
-        higher levels in the past. This encourages coarse-to-fine flow:
-        L0 can attend to everything before, L3 cannot attend to L0 in
-        the future, etc.
+        higher levels in the past. This encourages coarse-to-fine flow.
+
+    Optional geometry head:
+        If geo_dim > 0, a linear head maps hidden states to geometry
+        descriptors of dimension geo_dim.
     """
 
     def __init__(
@@ -63,26 +66,24 @@ class TransformerPriorLM(nn.Module):
         layer_norm_eps: float = 1e-5,
         use_hierarchical_attn: bool = True,
         pad_token_id: Optional[int] = None,
+        geo_dim: int = 0,
     ):
         super().__init__()
 
         self.vocab_size = int(vocab_size)
         self.d_model = int(d_model)
         self.max_code_len = int(max_code_len)
-        self.max_seq_len = int(max_code_len) + 1  # BOS + codes
+        self.max_seq_len = int(max_code_len) + 1
         self.num_quantizers = max(1, int(num_quantizers))
         self.use_hierarchical_attn = bool(use_hierarchical_attn)
         self.pad_token_id = pad_token_id
+        self.geo_dim = int(geo_dim)
 
-        # Token embeddings (codes + specials)
         self.token_embed = nn.Embedding(self.vocab_size, self.d_model)
 
-        # Token-position embeddings in the RVQ-flattened sequence
         max_token_positions = int(math.ceil(self.max_code_len / float(self.num_quantizers)))
-        # +1 for BOS position
         self.pos_tok_embed = nn.Embedding(max_token_positions + 1, self.d_model)
 
-        # Level embeddings (0..num_quantizers-1, plus one slot for BOS)
         self.level_embed = nn.Embedding(self.num_quantizers + 1, self.d_model)
 
         encoder_layer = nn.TransformerEncoderLayer(
@@ -105,7 +106,12 @@ class TransformerPriorLM(nn.Module):
         if tie_embeddings:
             self.lm_head.weight = self.token_embed.weight
 
-        # Cache masks per (T, device, num_quantizers, use_hierarchical_attn)
+        self.geo_head: Optional[nn.Linear]
+        if self.geo_dim > 0:
+            self.geo_head = nn.Linear(self.d_model, self.geo_dim)
+        else:
+            self.geo_head = None
+
         self._mask_cache: Dict[Tuple[int, str, int, bool, int], torch.Tensor] = {}
         self._reset_parameters()
 
@@ -115,6 +121,10 @@ class TransformerPriorLM(nn.Module):
         nn.init.normal_(self.level_embed.weight, mean=0.0, std=0.02)
         if self.lm_head.weight is not self.token_embed.weight:
             nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.02)
+        if self.geo_head is not None:
+            nn.init.normal_(self.geo_head.weight, mean=0.0, std=0.02)
+            if self.geo_head.bias is not None:
+                nn.init.zeros_(self.geo_head.bias)
 
     def _device_cache_key(self, T: int, device: torch.device) -> Tuple[int, str, int, bool, int]:
         dev_type = device.type
@@ -130,7 +140,7 @@ class TransformerPriorLM(nn.Module):
         if T <= 0:
             raise ValueError("T must be > 0")
 
-        level = torch.full((T,), self.num_quantizers, dtype=torch.long, device=device)  # BOS level
+        level = torch.full((T,), self.num_quantizers, dtype=torch.long, device=device)
         pos_tok = torch.zeros((T,), dtype=torch.long, device=device)
 
         if T > 1:
@@ -150,7 +160,6 @@ class TransformerPriorLM(nn.Module):
         if key in self._mask_cache:
             return self._mask_cache[key]
 
-        # Standard causal mask: positions cannot attend to future positions
         causal = torch.triu(
             torch.ones((T, T), device=device, dtype=torch.bool), diagonal=1
         )
@@ -158,28 +167,28 @@ class TransformerPriorLM(nn.Module):
         if (not self.use_hierarchical_attn) or self.num_quantizers <= 1 or T <= 2:
             mask = causal
         else:
-            # Level layout along the time axis (BOS has level -1)
             lvl = torch.full((T,), -1, dtype=torch.long, device=device)
             if T > 1:
                 lvl[1:] = torch.arange(T - 1, device=device, dtype=torch.long) % self.num_quantizers
 
-            lvl_q = lvl[:, None]  # [T, 1]
-            lvl_k = lvl[None, :]  # [1, T]
+            lvl_q = lvl[:, None]
+            lvl_k = lvl[None, :]
 
-            # Disallow attention from lower level to higher level in the past
             hier = (lvl_k > lvl_q) & (lvl_q >= 0) & (lvl_k >= 0)
             mask = causal | hier
 
         self._mask_cache[key] = mask
         return mask
 
-    def forward(
+    def forward_with_hidden(
         self,
         input_ids: torch.Tensor,
         attn_mask: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
+        Forward pass that returns both logits and hidden states.
+
         Args:
             input_ids: LongTensor [B, T]
             attn_mask / attention_mask: Bool or LongTensor [B, T],
@@ -187,17 +196,16 @@ class TransformerPriorLM(nn.Module):
 
         Returns:
             logits: FloatTensor [B, T, vocab_size]
+            hidden: FloatTensor [B, T, d_model]
         """
         if attention_mask is None:
             attention_mask = attn_mask
 
         B, T = input_ids.shape
 
-        # Truncate if sequence is longer than max_seq_len
         if T > self.max_seq_len:
             keep = self.max_seq_len
             if keep >= 2:
-                # Always keep BOS (first) and the last (keep - 1) codes
                 input_ids = torch.cat(
                     [input_ids[:, :1], input_ids[:, -(keep - 1):]], dim=1
                 )
@@ -213,7 +221,6 @@ class TransformerPriorLM(nn.Module):
 
         device = input_ids.device
 
-        # RVQ-aware position and level ids
         level_ids, pos_tok_ids = self._level_and_pos_ids(T, device)
         level_ids = level_ids.unsqueeze(0).expand(B, T)
         pos_tok_ids = pos_tok_ids.unsqueeze(0).expand(B, T)
@@ -235,6 +242,22 @@ class TransformerPriorLM(nn.Module):
         h = self.transformer(x, mask=attn, src_key_padding_mask=src_key_padding_mask)
         h = self.ln_f(h)
         logits = self.lm_head(h)
+        return logits, h
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Standard forward that returns only logits.
+        """
+        logits, _ = self.forward_with_hidden(
+            input_ids=input_ids,
+            attn_mask=attn_mask,
+            attention_mask=attention_mask,
+        )
         return logits
 
     def loss(
@@ -266,7 +289,6 @@ class TransformerPriorLM(nn.Module):
                 label_smoothing=ls,
             )
         except TypeError:
-            # Fallback for older PyTorch without label_smoothing arg
             log_probs = F.log_softmax(logits_2d, dim=-1)
             nll = -log_probs.gather(dim=-1, index=targets_1d.unsqueeze(-1)).squeeze(-1)
             smooth = -log_probs.mean(dim=-1)
@@ -349,11 +371,11 @@ def build_prior_from_config(cfg: Dict[str, Any]) -> TransformerPriorLM:
     if code_vocab_k <= 0:
         raise ValueError("cfg.vq.codebook_size must be set")
 
-    # Code vocab plus three specials: PAD, BOS, EOS
     vocab_size = int(code_vocab_k + 3)
 
     num_quantizers = int(model_cfg.get("num_quantizers", vq_cfg.get("num_quantizers", 4)))
     max_code_len = int(data_cfg.get("max_len", model_cfg.get("max_code_len", 256)))
+    geo_dim = int(model_cfg.get("geo_dim", 0))
 
     return TransformerPriorLM(
         vocab_size=vocab_size,
@@ -368,4 +390,5 @@ def build_prior_from_config(cfg: Dict[str, Any]) -> TransformerPriorLM:
         layer_norm_eps=float(model_cfg.get("layer_norm_eps", 1e-5)),
         use_hierarchical_attn=bool(model_cfg.get("use_hierarchical_attn", True)),
         pad_token_id=model_cfg.get("pad_token_id", None),
+        geo_dim=geo_dim,
     )

@@ -79,8 +79,8 @@ python prior/sample_prior.py \
   --num_samples 200 \
   --latent_len 256 \
   --target_len 350 \
-  --temperature 1.0 \
-  --top_k 0 \
+  --temperature 0.8 \
+  --top_k 64 \
   --top_p 0.95 \
   --repetition_penalty 1.0 \
   --indices_dtype int16 \
