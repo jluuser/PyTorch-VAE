@@ -7,7 +7,9 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset
 
-# [Added] Import UMAP and joblib for model saving
+import yaml  # optional config override
+
+# UMAP + joblib for model saving
 import umap
 import joblib
 
@@ -20,11 +22,14 @@ from sklearn.manifold import TSNE
 """
 Example:
 
-python scripts/visualize_latent_and_codebook2.py \
-  --ckpt /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/checkpoints/vq_s_gradient_ckpt_test11_15/epochepoch=549.ckpt \
+python scripts/playground/visualize_latent_and_codebook2.py \
+  --ckpt /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/checkpoints/vq_token64_K1024_D512_ResidualVQ_fromscratch/epochepoch=139.ckpt \
   --data_dir /public/home/zhangyangroup/chengshiz/keyuan.zhou/prp-dataset/curves_npy_CATH_by_cath \
-  --latent_n_tokens 48 \
-  --code_dim 128 \
+  --latent_n_tokens 64 \
+  --code_dim 512 \
+  --codebook_size 1024 \
+  --num_quantizers 4 \
+  --latent_source zq \
   --hidden_dim 512 \
   --num_layers 4 \
   --num_heads 8 \
@@ -33,27 +38,47 @@ python scripts/visualize_latent_and_codebook2.py \
   --max_len 80 \
   --max_points 350000 \
   --perplexity 30 \
+  --n_neighbors 20 \
+  --min_dist 0.1 \
   --batch_size 256 \
   --num_workers 16
 """
 
+# -------------------------------------------------------
+# Repo path setup
+# -------------------------------------------------------
 THIS_DIR = os.path.abspath(os.path.dirname(__file__))
-REPO_ROOT = os.path.abspath(os.path.join(THIS_DIR, ".."))
+# file is under scripts/playground/, repo root is two levels up
+REPO_ROOT = os.path.abspath(os.path.join(THIS_DIR, "..", ".."))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 from models.vq_vae import VQVAE
 from dataset import CurveDataset, pad_collate
 
-# ---------------------------------------------------------------------
+# -------------------------------------------------------
 # CATH classes to keep (top level)
-# ---------------------------------------------------------------------
+# -------------------------------------------------------
 KEPT_CLASSES = (1,)
 CLASSES_TAG = "_".join(str(c) for c in KEPT_CLASSES)
 
 
+# -------------------------------------------------------
+# Argument parsing
+# -------------------------------------------------------
 def parse_args():
-    p = argparse.ArgumentParser("Sequence-level t-SNE with CATH / SS / length coloring")
+    p = argparse.ArgumentParser(
+        "Sequence-level t-SNE / UMAP with CATH / SS / length coloring (Residual VQ aware)"
+    )
+
+    # optional YAML config: override model hyperparams safely
+    p.add_argument(
+        "--config",
+        type=str,
+        default="",
+        help="optional YAML config; if set, overrides model hyperparams (hidden_dim, code_dim, latent_tokens, num_quantizers, codebook_size, ...)",
+    )
+
     p.add_argument("--ckpt", type=str, required=True)
     p.add_argument("--data_dir", type=str, required=True)
     p.add_argument(
@@ -62,6 +87,8 @@ def parse_args():
         default="",
         help="optional list file; if empty, auto scan data_dir recursively and filter by length",
     )
+
+    # model hyperparams (can be overridden from YAML)
     p.add_argument("--hidden_dim", type=int, default=512)
     p.add_argument("--num_layers", type=int, default=4)
     p.add_argument("--num_heads", type=int, default=8)
@@ -74,15 +101,35 @@ def parse_args():
     p.add_argument(
         "--code_dim",
         type=int,
-        default=128,
+        default=512,
         help="latent code dimension",
+    )
+    p.add_argument(
+        "--codebook_size",
+        type=int,
+        default=1024,
+        help="number of codes per residual-VQ level",
+    )
+    p.add_argument(
+        "--num_quantizers",
+        type=int,
+        default=4,
+        help="number of residual VQ levels (L); total codes = L * codebook_size",
     )
     p.add_argument(
         "--latent_n_tokens",
         type=int,
-        default=48,
-        help="number of latent tokens per sequence",
+        default=64,
+        help="number of latent tokens per sequence (N); e.g. 64",
     )
+    p.add_argument(
+        "--latent_source",
+        type=str,
+        default="zq",
+        choices=["ze", "zq"],
+        help="use pre-quantized token latents (ze) or quantized token latents (zq) for visualization",
+    )
+
     p.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"])
     p.add_argument("--batch_size", type=int, default=256)
     p.add_argument("--num_workers", type=int, default=8)
@@ -90,7 +137,7 @@ def parse_args():
         "--max_points",
         type=int,
         default=30000,
-        help="max number of curves (points) for t-SNE",
+        help="max number of curves (points) for visualization; will be stratified by CATH class",
     )
     p.add_argument(
         "--min_len",
@@ -106,7 +153,7 @@ def parse_args():
     )
     p.add_argument("--perplexity", type=float, default=30.0)
 
-    # [Added] UMAP specific arguments
+    # UMAP specific arguments
     p.add_argument("--n_neighbors", type=int, default=15, help="UMAP n_neighbors parameter")
     p.add_argument("--min_dist", type=float, default=0.1, help="UMAP min_dist parameter")
 
@@ -115,6 +162,9 @@ def parse_args():
     return p.parse_args()
 
 
+# -------------------------------------------------------
+# Utility functions
+# -------------------------------------------------------
 def strip_prefixes(state_dict, prefixes=("model.", "module.", "net.")):
     out = {}
     for k, v in state_dict.items():
@@ -125,13 +175,6 @@ def strip_prefixes(state_dict, prefixes=("model.", "module.", "net.")):
                 break
         out[name] = v
     return out
-
-
-def drop_quantizer_keys(state_dict):
-    keys = [k for k in state_dict.keys() if k.startswith("quantizer.")]
-    for k in keys:
-        state_dict.pop(k, None)
-    return state_dict
 
 
 def infer_cath_class_from_relpath(rel_path):
@@ -347,6 +390,9 @@ def stratified_curve_indices(labels, max_points):
     return selected
 
 
+# -------------------------------------------------------
+# Latent collection (Residual VQ aware)
+# -------------------------------------------------------
 @torch.no_grad()
 def collect_seq_latents_with_labels_and_stats(
     model,
@@ -354,10 +400,13 @@ def collect_seq_latents_with_labels_and_stats(
     device,
     use_amp,
     labels_for_loader,
-    latent_n_tokens,
+    latent_source: str = "zq",
 ):
     """
     Collect sequence-level latent vectors and basic statistics.
+    If latent_source == "ze": use encoder+tokenizer output.
+    If latent_source == "zq": pass through residual VQ and use quantized latents,
+                              also collect local code indices per level.
     """
     rows = []
     labs = []
@@ -366,6 +415,7 @@ def collect_seq_latents_with_labels_and_stats(
     loop_list = []
     len_list = []
     idx_offset = 0
+    all_indices_local = []
 
     try:
         autocast_ctx = torch.amp.autocast(
@@ -393,14 +443,68 @@ def collect_seq_latents_with_labels_and_stats(
                     (B, x.size(1)), dtype=torch.bool, device=device
                 )
 
+            # encoder -> token-level continuous latents
             h_fuse, _, _ = model.encode(x, mask=mask)
-            z_tok = model._tokenize_to_codes(h_fuse, mask)
-            z_seq = z_tok.mean(dim=1)
+            z_e_tok = model._tokenize_to_codes(h_fuse, mask)  # [B, N, D]
+
+            indices_local_this = None
+
+            if str(latent_source).lower() == "zq":
+                if getattr(model, "quantizer", None) is None:
+                    raise RuntimeError("latent_source=zq requires a VQ-enabled model (model.quantizer is None)")
+
+                B_, N_, D_ = z_e_tok.shape
+                token_mask = torch.ones(
+                    (B_, N_), dtype=torch.bool, device=device
+                )
+
+                # residual VQ forward
+                z_q_st, z_q, all_indices_cat, _ = model.quantizer(
+                    z_e_tok,
+                    do_ema_update=False,
+                    allow_reinit=False,
+                    mask=token_mask,
+                )
+                z_tok = z_q  # [B, N, D]
+
+                # all_indices_cat: [L*N], L=num_quantizers, N=B*N_tokens
+                L = int(getattr(model.quantizer, "num_quantizers", getattr(model, "num_quantizers", 1)))
+                if L > 1:
+                    K_per = int(getattr(model.quantizer, "K_per", 0))
+                    if K_per <= 0:
+                        raise RuntimeError("quantizer.K_per must be > 0 for residual VQ")
+
+                    # reshape: [L, B*N]
+                    all_indices_lv = all_indices_cat.view(L, B_, N_)
+                    # [B, N, L] (global indices)
+                    indices_global = all_indices_lv.view(L, B_, N_).permute(1, 2, 0)  # [B,N,L]
+
+                    # convert to local indices 0..K_per-1 using level offsets
+                    level_ids = torch.arange(L, device=indices_global.device).view(1, 1, L)
+                    offsets = level_ids * K_per
+                    indices_local = indices_global - offsets  # [B,N,L]
+
+                    indices_local_this = indices_local.cpu().numpy()
+                else:
+                    # single-level: all_indices_cat is [B*N]
+                    indices_global = all_indices_cat.view(B_, N_)
+                    indices_local_this = indices_global.unsqueeze(-1).cpu().numpy()  # [B,N,1]
+            else:
+                # use ze directly
+                z_tok = z_e_tok
+
+            # sequence-level latent = mean of token latents
+            z_seq = z_tok.mean(dim=1)  # [B, D]
             rows.append(z_seq.cpu())
 
+            if indices_local_this is not None:
+                all_indices_local.append(indices_local_this)
+
+            # length stats
             length = mask.sum(dim=1).to(torch.float32)
             len_list.append(length.cpu().numpy())
 
+            # secondary structure fractions
             ss = x[..., 3:]
             valid = mask.unsqueeze(-1).to(ss.dtype)
             ss_valid = ss * valid
@@ -428,6 +532,10 @@ def collect_seq_latents_with_labels_and_stats(
     loop_frac = np.concatenate(loop_list, axis=0)
     lengths = np.concatenate(len_list, axis=0)
 
+    indices_local = None
+    if all_indices_local:
+        indices_local = np.concatenate(all_indices_local, axis=0)  # [num_samples, N_tokens, L]
+
     print("[Latents] collected curves: {}".format(latents.shape[0]))
     print(
         "[Stats] helix_frac range=({:.3f},{:.3f}), sheet_frac range=({:.3f},{:.3f}), "
@@ -442,9 +550,14 @@ def collect_seq_latents_with_labels_and_stats(
             lengths.max(),
         )
     )
-    return latents, labels, helix_frac, sheet_frac, loop_frac, lengths
+    if indices_local is not None:
+        print("[Indices] collected local indices with shape {}".format(indices_local.shape))
+    return latents, labels, helix_frac, sheet_frac, loop_frac, lengths, indices_local
 
 
+# -------------------------------------------------------
+# Color utilities for SS simplex palette
+# -------------------------------------------------------
 HELIX_COLOR = np.array([239, 68, 68], dtype=np.float32) / 255.0
 SHEET_COLOR = np.array([34, 197, 94], dtype=np.float32) / 255.0
 LOOP_COLOR  = np.array([59, 130, 246], dtype=np.float32) / 255.0
@@ -581,10 +694,45 @@ def generate_simplex_palette(
     plt.close(fig)
 
 
+# -------------------------------------------------------
+# Main
+# -------------------------------------------------------
 def main():
     args = parse_args()
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
+
+    # Optional: override model hyperparams from YAML config
+    if getattr(args, "config", ""):
+        with open(args.config, "r") as f:
+            cfg = yaml.safe_load(f)
+        mp = (cfg or {}).get("model_params", {})
+        for k_src, k_dst in [
+            ("hidden_dim", "hidden_dim"),
+            ("num_layers", "num_layers"),
+            ("num_heads", "num_heads"),
+            ("max_seq_len", "max_seq_len"),
+            ("code_dim", "code_dim"),
+            ("latent_tokens", "latent_n_tokens"),
+            ("num_quantizers", "num_quantizers"),
+            ("codebook_size", "codebook_size"),
+        ]:
+            if k_src in mp:
+                setattr(args, k_dst, int(mp[k_src]))
+        print(
+            "[Config] override model params from {}: hidden_dim={}, num_layers={}, num_heads={}, "
+            "max_seq_len={}, code_dim={}, latent_n_tokens={}, num_quantizers={}, codebook_size={}".format(
+                args.config,
+                args.hidden_dim,
+                args.num_layers,
+                args.num_heads,
+                args.max_seq_len,
+                args.code_dim,
+                args.latent_n_tokens,
+                args.num_quantizers,
+                args.codebook_size,
+            )
+        )
 
     device = torch.device(
         "cuda" if (args.device == "cuda" and torch.cuda.is_available()) else "cpu"
@@ -659,25 +807,30 @@ def main():
     )
     os.makedirs(out_dir, exist_ok=True)
 
-    # simplex_palette_png = os.path.join(out_dir, "simplex_palette.png")
-    # generate_simplex_palette(
-    #     simplex_palette_png,
-    #     HELIX_COLOR,
-    #     SHEET_COLOR,
-    #     LOOP_COLOR,
-    #     size=400,
-    #     padding=40,
-    #     weight_exp=1.0,
-    # )
+    # optional palette visualization
+    simplex_palette_png = os.path.join(out_dir, "simplex_palette.png")
+    generate_simplex_palette(
+        simplex_palette_png,
+        HELIX_COLOR,
+        SHEET_COLOR,
+        LOOP_COLOR,
+        size=400,
+        padding=40,
+        weight_exp=1.0,
+    )
+    print("[Palette] saved simplex palette to {}".format(simplex_palette_png))
 
+    # Build a VQ-enabled model so we can visualize either ze or zq.
     model = VQVAE(
         input_dim=6,
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
         num_heads=args.num_heads,
         max_seq_len=args.max_seq_len,
-        use_vq=False,
-        codebook_size=1,
+        use_vq=True,
+        residual_vq=(int(args.num_quantizers) > 1),
+        num_quantizers=int(args.num_quantizers),
+        codebook_size=int(args.codebook_size),
         code_dim=args.code_dim,
         label_smoothing=0.0,
         ss_tv_lambda=0.0,
@@ -702,18 +855,19 @@ def main():
     ckpt = torch.load(args.ckpt, map_location="cpu")
     state = ckpt.get("state_dict", ckpt)
     state = strip_prefixes(state)
-    state = drop_quantizer_keys(state)
+    # important: do NOT drop quantizer keys now; we want the trained codebook
     missing, unexpected = model.load_state_dict(state, strict=False)
     print("[Load] missing={} unexpected={}".format(len(missing), len(unexpected)))
 
-    latents_seq, labels_seq, helix_frac, sheet_frac, loop_frac, lengths = \
+    # collect latents
+    latents_seq, labels_seq, helix_frac, sheet_frac, loop_frac, lengths, indices_local = \
         collect_seq_latents_with_labels_and_stats(
             model=model,
             loader=loader,
             device=device,
             use_amp=bool(args.amp),
             labels_for_loader=labels_for_loader,
-            latent_n_tokens=int(args.latent_n_tokens),
+            latent_source=str(args.latent_source),
         )
 
     X = latents_seq.numpy().astype(np.float32, copy=False)
@@ -731,7 +885,7 @@ def main():
     print("[t-SNE] done")
 
     # -----------------------------------------------------------------
-    # [Added] Compute UMAP and Save Model
+    # UMAP: fit + save reducer + coordinates
     # -----------------------------------------------------------------
     print(f"[UMAP] running UMAP on {X.shape[0]} points of dim={X.shape[1]}...")
     reducer = umap.UMAP(
@@ -739,13 +893,11 @@ def main():
         min_dist=args.min_dist,
         n_components=2,
         metric="euclidean",
-        random_state=args.seed
+        random_state=args.seed,
     )
-    # fit_transform trains the model AND returns the coordinates
     X_umap_2d = reducer.fit_transform(X)
     print("[UMAP] done")
 
-    # Save the trained reducer model so we can transform new points later
     umap_model_name = "umap_reducer_class{}_len_between_{}_{}.pkl".format(
         classes_tag,
         int(args.min_len),
@@ -754,9 +906,12 @@ def main():
     umap_model_path = os.path.join(out_dir, umap_model_name)
     joblib.dump(reducer, umap_model_path)
     print("[UMAP] saved reducer model to {}".format(umap_model_path))
-    # -----------------------------------------------------------------
 
-    cache_name = "tsne_cache_class{}_len_between_{}_{}.npz".format(
+    # -----------------------------------------------------------------
+    # Save full cache (latents + tsne + umap + stats + indices)
+    # -----------------------------------------------------------------
+    cache_name = "tsne_cache_resvq_{}_class{}_len_between_{}_{}.npz".format(
+        str(args.latent_source),
         classes_tag,
         int(args.min_len),
         int(args.max_len),
@@ -767,8 +922,8 @@ def main():
         cache_path,
         latents=latents_seq.numpy().astype(np.float32, copy=False),
         tsne_2d=X2d.astype(np.float32, copy=False),
-        # [Added] Save UMAP coordinates as well
         umap_2d=X_umap_2d.astype(np.float32, copy=False),
+        indices_local=indices_local,
         labels=labels_seq,
         helix_frac=helix_frac.astype(np.float32, copy=False),
         sheet_frac=sheet_frac.astype(np.float32, copy=False),
@@ -781,12 +936,15 @@ def main():
         perplexity=float(args.perplexity),
         latent_n_tokens=int(args.latent_n_tokens),
         code_dim=int(args.code_dim),
+        codebook_size=int(args.codebook_size),
+        num_quantizers=int(args.num_quantizers),
+        latent_source=str(args.latent_source),
         max_seq_len=int(args.max_seq_len),
         min_len=int(args.min_len),
         max_len=int(args.max_len),
         cath_kept_classes=np.array(KEPT_CLASSES, dtype=np.int64),
     )
-    print("[Cache] saved t-SNE (and UMAP) cache to {}".format(cache_path))
+    print("[Cache] saved t-SNE + UMAP cache to {}".format(cache_path))
 
 
 if __name__ == "__main__":

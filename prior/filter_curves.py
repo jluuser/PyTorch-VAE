@@ -7,10 +7,10 @@ Filter decoded protein curves by geometric and secondary-structure heuristics.
 Typical usage:
 
 python prior/filter_curves.py \
-  --recon_dir /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/prior/prior_samples_1_8_new_decoded \
-  --out_dir /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/prior/prior_samples_1_8_new_decoded_filtered \
+  --recon_dir /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/prior/new_prior_recons_1_8 \
+  --out_dir /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/prior/new_prior_recons_1_8_filtered \
   --samples_manifest /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/prior/prior_samples_1_8_new/samples_manifest.jsonl \
-  --filtered_manifest_out /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/prior/prior_samples_1_8_new_decoded_filtered/manifest.jsonl \
+  --filtered_manifest_out /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/prior/new_prior_recons_1_8_filtered/manifest.jsonl \
   --min_pairwise_dist 2.0 \
   --neighbor_exclude 2 \
   --min_beta_run 0 \

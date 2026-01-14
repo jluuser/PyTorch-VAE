@@ -7,6 +7,8 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset
 
+import yaml
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -17,11 +19,11 @@ from sklearn.manifold import TSNE
 Example:
 
 python scripts/visualize_latent_and_codebook.py \
-  --ckpt /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/checkpoints/vq_s_gradient_ckpt_test11_15/epochepoch=549.ckpt \
+  --ckpt /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/checkpoints/vq_token64_K1024_D512_ResidualVQ_fromscratch/epochepoch=139.ckpt \
   --data_dir /public/home/zhangyangroup/chengshiz/keyuan.zhou/prp-dataset/curves_npy_CATH_by_cath \
-  --latent_n_tokens 48 \
-  --code_dim 128 \
-  --codebook_size 512 \
+  --latent_n_tokens 64 \
+  --code_dim 512 \
+  --codebook_size 1024 \
   --hidden_dim 512 \
   --num_layers 4 \
   --num_heads 8 \
@@ -51,6 +53,12 @@ CLASSES_TAG = "_".join(str(c) for c in KEPT_CLASSES)
 
 def parse_args():
     p = argparse.ArgumentParser("Sequence-level t-SNE with CATH / SS / length coloring")
+    p.add_argument(
+        "--config",
+        type=str,
+        default="",
+        help="optional YAML config; if set, overrides model hyperparams (code_dim, hidden_dim, ..., num_quantizers, codebook_size, latent_tokens)",
+    )
     p.add_argument("--ckpt", type=str, required=True)
     p.add_argument("--data_dir", type=str, required=True)
     p.add_argument(
@@ -78,7 +86,20 @@ def parse_args():
         "--codebook_size",
         type=int,
         default=512,
-        help="number of codes in the VQ codebook",
+        help="number of codes per residual-VQ level",
+    )
+    p.add_argument(
+        "--num_quantizers",
+        type=int,
+        default=1,
+        help="residual VQ levels (total codes = num_quantizers * codebook_size)",
+    )
+    p.add_argument(
+        "--latent_source",
+        type=str,
+        default="ze",
+        choices=["ze", "zq"],
+        help="use pre-quantized token latents (ze) or quantized token latents (zq) for visualization",
     )
     p.add_argument(
         "--latent_n_tokens",
@@ -332,6 +353,7 @@ def collect_seq_latents_with_labels_and_stats(
     use_amp,
     labels_for_loader,
     latent_n_tokens,
+    latent_source: str = "ze",
 ):
     rows = []
     labs = []
@@ -367,9 +389,26 @@ def collect_seq_latents_with_labels_and_stats(
                     (B, x.size(1)), dtype=torch.bool, device=device
                 )
 
-            # encoder -> token-level codes (here codes are quantized if use_vq=True)
+            # encoder -> token-level continuous latents
             h_fuse, _, _ = model.encode(x, mask=mask)
-            z_tok = model._tokenize_to_codes(h_fuse, mask)
+            z_e_tok = model._tokenize_to_codes(h_fuse, mask)  # [B,N,D]
+
+            if str(latent_source).lower() == "zq":
+                if getattr(model, "quantizer", None) is None:
+                    raise RuntimeError("latent_source=zq requires a VQ-enabled model (model.quantizer is None)")
+                token_mask = torch.ones(
+                    (B, z_e_tok.size(1)), dtype=torch.bool, device=device
+                )
+                z_q_st, z_q, _, _ = model.quantizer(
+                    z_e_tok,
+                    do_ema_update=False,
+                    allow_reinit=False,
+                    mask=token_mask,
+                )
+                z_tok = z_q
+            else:
+                z_tok = z_e_tok
+
             z_seq = z_tok.mean(dim=1)
             rows.append(z_seq.cpu())
 
@@ -561,6 +600,37 @@ def main():
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
+    # Optional: override model hyperparams from YAML config (safer for new checkpoints)
+    if getattr(args, "config", ""):
+        with open(args.config, "r") as f:
+            cfg = yaml.safe_load(f)
+        mp = (cfg or {}).get("model_params", {})
+        for k_src, k_dst in [
+            ("hidden_dim", "hidden_dim"),
+            ("num_layers", "num_layers"),
+            ("num_heads", "num_heads"),
+            ("max_seq_len", "max_seq_len"),
+            ("code_dim", "code_dim"),
+            ("latent_tokens", "latent_n_tokens"),
+            ("num_quantizers", "num_quantizers"),
+            ("codebook_size", "codebook_size"),
+        ]:
+            if k_src in mp:
+                setattr(args, k_dst, int(mp[k_src]))
+        print(
+            "[Config] override model params from {}: hidden_dim={}, num_layers={}, num_heads={}, max_seq_len={}, code_dim={}, latent_n_tokens={}, num_quantizers={}, codebook_size={}".format(
+                args.config,
+                args.hidden_dim,
+                args.num_layers,
+                args.num_heads,
+                args.max_seq_len,
+                args.code_dim,
+                args.latent_n_tokens,
+                args.num_quantizers,
+                args.codebook_size,
+            )
+        )
+
     device = torch.device(
         "cuda" if (args.device == "cuda" and torch.cuda.is_available()) else "cpu"
     )
@@ -645,7 +715,8 @@ def main():
         weight_exp=1.0,
     )
 
-    # VQ-enabled model: use_vq=True, codebook_size from args
+    # Build a VQ-enabled model so we can visualize either ze or zq.
+    # For residual VQ, pass num_quantizers and codebook_size per level.
     model = VQVAE(
         input_dim=6,
         hidden_dim=args.hidden_dim,
@@ -653,6 +724,8 @@ def main():
         num_heads=args.num_heads,
         max_seq_len=args.max_seq_len,
         use_vq=True,
+        residual_vq=(int(args.num_quantizers) > 1),
+        num_quantizers=int(args.num_quantizers),
         codebook_size=int(args.codebook_size),
         code_dim=args.code_dim,
         label_smoothing=0.0,
@@ -690,6 +763,7 @@ def main():
             use_amp=bool(args.amp),
             labels_for_loader=labels_for_loader,
             latent_n_tokens=int(args.latent_n_tokens),
+            latent_source=str(args.latent_source),
         )
 
     X = latents_seq.numpy().astype(np.float32, copy=False)

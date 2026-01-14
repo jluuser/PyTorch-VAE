@@ -45,8 +45,8 @@ Additionally, if "latents" is present in the cache, this script will also:
 
 Example:
 
-python scripts/analyze_tsne_cache2.py \
-  --cache latent_analysis/class1/tsne_cache_vq_class1_len_between_1_80.npz \
+python scripts/playground/analyze_tsne_cache2.py \
+  --cache latent_analysis/class1/tsne_cache_resvq_zq_class1_len_between_1_80.npz \
   --n_clusters 6 \
   --top_k_folds 5
 """

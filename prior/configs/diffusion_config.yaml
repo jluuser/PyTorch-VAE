@@ -1,0 +1,52 @@
+data:
+  train_manifest: "/public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/prior/out_prior_token64_K1024_D512_Residual_VQ_data/train/manifest.jsonl"
+  val_manifest:   "/public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/prior/out_prior_token64_K1024_D512_Residual_VQ_data/val/manifest.jsonl"
+  max_len: 256
+  batch_size: 128
+  num_workers: 8
+  pin_memory: true
+
+  # pad_id defaults to K_total from the loaded VQ quantizer
+  pad_token_id: 4096
+
+  # optional conditioning (requires geo_path in the manifest)
+  use_geo: false
+  geo_dim: 10
+
+vq:
+  ckpt: "/public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/checkpoints/vq_token64_K1024_D512_ResidualVQ_fromscratch/epochepoch=139.ckpt"
+  yaml: "configs/stage2_vq.yaml"
+
+diffusion:
+  num_steps: 1000
+  schedule: "cosine"   # cosine|linear
+  beta_start: 0.0001
+  beta_end: 0.02
+  cosine_s: 0.008
+
+model:
+  hidden_channels: 256
+  time_embed_dim: 256
+  num_blocks: 12
+  dropout: 0.0
+
+optim:
+  lr: 2.0e-4
+  betas: [0.9, 0.99]
+  weight_decay: 0.01
+  warmup_updates: 2000
+  max_updates: 200000
+  grad_clip_norm: 1.0
+
+ema:
+  enable: true
+  decay: 0.999
+
+runtime:
+  seed: 42
+  log_interval: 100
+  eval_interval_updates: 2000
+  save_interval_updates: 10000
+  ckpt_dir: "prior_ckpts/diffusion_prior"
+  device: "cuda"
+  amp: true
