@@ -12,7 +12,7 @@ import torch.nn.functional as F
 
 
 def sinusoidal_time_embedding(t: torch.Tensor, dim: int) -> torch.Tensor:
-    """Standard sinusoidal embedding.
+    """Standard sinusoidal time embedding.
 
     t: [B] int/float
     returns: [B, dim]
@@ -21,7 +21,11 @@ def sinusoidal_time_embedding(t: torch.Tensor, dim: int) -> torch.Tensor:
         t = t.view(-1)
     device = t.device
     half = dim // 2
-    freq = torch.exp(-math.log(10000.0) * torch.arange(0, half, device=device).float() / max(half - 1, 1))
+    freq = torch.exp(
+        -math.log(10000.0)
+        * torch.arange(0, half, device=device).float()
+        / max(half - 1, 1)
+    )
     ang = t.float().unsqueeze(1) * freq.unsqueeze(0)
     emb = torch.cat([torch.sin(ang), torch.cos(ang)], dim=1)
     if dim % 2 == 1:
@@ -30,6 +34,8 @@ def sinusoidal_time_embedding(t: torch.Tensor, dim: int) -> torch.Tensor:
 
 
 class ResBlock1D(nn.Module):
+    """Residual 1D conv block with time conditioning."""
+
     def __init__(
         self,
         channels: int,
@@ -39,7 +45,13 @@ class ResBlock1D(nn.Module):
     ):
         super().__init__()
         self.norm1 = nn.GroupNorm(num_groups=32, num_channels=channels)
-        self.conv1 = nn.Conv1d(channels, channels, kernel_size=3, padding=dilation, dilation=dilation)
+        self.conv1 = nn.Conv1d(
+            channels,
+            channels,
+            kernel_size=3,
+            padding=dilation,
+            dilation=dilation,
+        )
         self.time_proj = nn.Linear(time_dim, channels)
         self.norm2 = nn.GroupNorm(num_groups=32, num_channels=channels)
         self.drop = nn.Dropout(float(dropout))
@@ -65,8 +77,12 @@ class DenoiserConfig:
 class DiffusionDenoiserResNet1D(nn.Module):
     """1D residual conv denoiser for token sequences.
 
-    Inputs/outputs use token-major layout: [B, M, D]. Internally uses Conv1d with
-    channel-major layout: [B, C, M].
+    Inputs/outputs use token-major layout: [B, M, D].
+    Internally uses Conv1d with channel-major layout: [B, C, M].
+
+    In this project, the network is treated as an x-prediction model:
+    - Input:  noisy latent x_t
+    - Output: clean latent x_0 prediction with the same shape
     """
 
     def __init__(self, cfg: DenoiserConfig):
@@ -92,7 +108,14 @@ class DiffusionDenoiserResNet1D(nn.Module):
         blocks = []
         dilations = [2 ** (i % 6) for i in range(int(cfg.num_blocks))]
         for d in dilations:
-            blocks.append(ResBlock1D(C, time_dim=T, dilation=int(d), dropout=float(cfg.dropout)))
+            blocks.append(
+                ResBlock1D(
+                    C,
+                    time_dim=T,
+                    dilation=int(d),
+                    dropout=float(cfg.dropout),
+                )
+            )
         self.blocks = nn.ModuleList(blocks)
 
     def forward(
@@ -102,6 +125,16 @@ class DiffusionDenoiserResNet1D(nn.Module):
         cond: Optional[torch.Tensor] = None,
         mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """Forward pass.
+
+        xt:   [B, M, D] noisy latent x_t
+        t:    [B] integer time steps (0..T-1)
+        cond: optional conditioning tensor [B, M, C_cond]
+        mask: optional boolean mask [B, M] (True for valid tokens)
+
+        Returns:
+            x0_pred: [B, M, D] clean latent prediction x_0.
+        """
         if xt.dim() != 3:
             raise ValueError(f"xt must be [B,M,D], got {xt.shape}")
         B, M, D = xt.shape
@@ -110,6 +143,7 @@ class DiffusionDenoiserResNet1D(nn.Module):
             if mask.shape != (B, M):
                 raise ValueError(f"mask must be [B,M]={B,M}, got {mask.shape}")
 
+        # Time embedding
         t_emb = sinusoidal_time_embedding(t, self.cfg.time_embed_dim)
         t_emb = self.time_mlp(t_emb)
 
@@ -117,8 +151,10 @@ class DiffusionDenoiserResNet1D(nn.Module):
         if mask is not None:
             x = x * mask[:, :, None].to(x.dtype)
 
-        h = self.in_proj(x.transpose(1, 2))  # [B,C,M]
+        # [B, M, D] -> [B, D, M]
+        h = self.in_proj(x.transpose(1, 2))
 
+        # Optional per-token conditioning
         if cond is not None and self.cond_proj is not None:
             if cond.shape[:2] != (B, M):
                 raise ValueError(f"cond must be [B,M,*], got {cond.shape}")

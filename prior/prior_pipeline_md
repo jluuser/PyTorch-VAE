@@ -54,9 +54,11 @@ These must match the paths in `prior/configs/prior_config.yaml`.
 ## Step 2: Train **Transformer Prior**
 
 ```bash
-torchrun --nproc_per_node=4 prior/train_diffusion_prior.py \
+python prior/train_diffusion.py \
   --config prior/configs/diffusion_config.yaml \
-  --vq_yaml  configs/stage2_vq.yaml
+  --vq_ckpt checkpoints/vq_token64_K1024_D512_ResidualVQ_fromscratch/epochepoch=139.ckpt \
+  --vq_yaml configs/stage2_vq.yaml
+
 ```
 
 After training ends, the files will be located at:
@@ -79,7 +81,7 @@ python prior/sample_diffusion.py \
   --config prior/configs/diffusion_config.yaml \
   --vq_ckpt /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/checkpoints/vq_token64_K1024_D512_ResidualVQ_fromscratch/epochepoch=139.ckpt \
   --vq_yaml configs/stage2_vq.yaml \
-  --num_samples 10 \
+  --num_samples 5 \
   --batch_size 16 \
   --sample_steps 100 \
   --target_len 350 \
@@ -101,7 +103,7 @@ python scripts/decode_indices_with_vqvae.py \
   --vq_yaml  /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/configs/stage2_vq.yaml \
   --samples_manifest /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/prior/diffusion_prior_samples_step190000/samples_manifest.jsonl \
   --out_dir /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/prior/diffusion_prior_recons_step190000 \
-  --check_latent_len 256 \
+  --check_latent_len 64 \
   --device cuda
 ```
 ## Step 5: filter

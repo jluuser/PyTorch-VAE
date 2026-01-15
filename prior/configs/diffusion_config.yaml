@@ -1,30 +1,45 @@
-data:
-  train_manifest: "/public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/prior/out_prior_token64_K1024_D512_Residual_VQ_data/train/manifest.jsonl"
-  val_manifest:   "/public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/prior/out_prior_token64_K1024_D512_Residual_VQ_data/val/manifest.jsonl"
-  max_len: 256
-  batch_size: 128
-  num_workers: 8
-  pin_memory: true
+# Diffusion prior configuration (x-prediction on normalized z_q)
 
-  # pad_id defaults to K_total from the loaded VQ quantizer
+data:
+  # JSONL manifest with indices_path, latent_len, target_len etc.
+  train_manifest: "prior/out_prior_token64_K1024_D512_Residual_VQ_data/train/manifest.jsonl"
+  val_manifest: "prior/out_prior_token64_K1024_D512_Residual_VQ_data/val/manifest.jsonl"
+
+  # Pad token id used when extracting indices for prior training
   pad_token_id: 4096
 
-  # optional conditioning (requires geo_path in the manifest)
+  # Maximum flattened latent length (optional). Should be multiple of num_quantizers.
+  max_len: 256
+
+  batch_size: 64
+  num_workers: 4
+
+  # Optional geometric conditioning (not used in this config)
   use_geo: false
-  geo_dim: 10
+  geo_dim: 0
+
+  pin_memory: true
+
+  # Number of residual quantizers used by the VQ-VAE
+  num_quantizers: 4
 
 vq:
-  ckpt: "/public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/checkpoints/vq_token64_K1024_D512_ResidualVQ_fromscratch/epochepoch=139.ckpt"
+  # You should override these with your actual VQ-VAE paths
+  ckpt: "checkpoints/vq_token64_K1024_D512_ResidualVQ_fromscratch/epochepoch=139.ckpt"
   yaml: "configs/stage2_vq.yaml"
 
 diffusion:
+  # Number of diffusion steps T (training and sampling time index range 0..T-1)
   num_steps: 1000
-  schedule: "cosine"   # cosine|linear
-  beta_start: 0.0001
-  beta_end: 0.02
+
+  # Beta schedule used by GaussianDiffusion (DDPM-style)
+  schedule: "cosine"    # or "linear"
+  beta_start: 1.0e-4
+  beta_end: 2.0e-2
   cosine_s: 0.008
 
 model:
+  # 1D ResNet denoiser configuration
   hidden_channels: 256
   time_embed_dim: 256
   num_blocks: 12
@@ -33,9 +48,10 @@ model:
 optim:
   lr: 2.0e-4
   betas: [0.9, 0.99]
-  weight_decay: 0.01
-  warmup_updates: 2000
+  weight_decay: 0.0
+
   max_updates: 200000
+  warmup_updates: 2000
   grad_clip_norm: 1.0
 
 ema:
@@ -44,9 +60,14 @@ ema:
 
 runtime:
   seed: 42
+  amp: true
+  device: "cuda"
+
+  ckpt_dir: "prior_ckpts/diffusion_prior_1_15"
+
   log_interval: 100
   eval_interval_updates: 2000
   save_interval_updates: 10000
-  ckpt_dir: "prior_ckpts/diffusion_prior"
-  device: "cuda"
-  amp: true
+
+  # Path to the z_q statistics computed by scripts/compute_zq_stats.py
+  zq_stats_path: "prior/zq_stats_token64_K1024_D512.npz"

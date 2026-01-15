@@ -21,6 +21,7 @@ Run.ipynb
 *.ckpt
 *.pt
 *.pth
+*.npz
 *.npy
 *.json
 *.jsonl
