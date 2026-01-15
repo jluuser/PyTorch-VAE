@@ -14,8 +14,12 @@ import torch.nn.functional as F
 def sinusoidal_time_embedding(t: torch.Tensor, dim: int) -> torch.Tensor:
     """Standard sinusoidal time embedding.
 
-    t: [B] int/float
-    returns: [B, dim]
+    Args:
+        t: [B] int or float tensor of timesteps.
+        dim: embedding dimension.
+
+    Returns:
+        Tensor of shape [B, dim].
     """
     if t.dim() != 1:
         t = t.view(-1)
@@ -34,7 +38,7 @@ def sinusoidal_time_embedding(t: torch.Tensor, dim: int) -> torch.Tensor:
 
 
 class ResBlock1D(nn.Module):
-    """Residual 1D conv block with time conditioning."""
+    """Residual 1D block with time conditioning."""
 
     def __init__(
         self,
@@ -58,6 +62,15 @@ class ResBlock1D(nn.Module):
         self.conv2 = nn.Conv1d(channels, channels, kernel_size=3, padding=1)
 
     def forward(self, x: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
+        """Forward pass.
+
+        Args:
+            x: [B, C, M] feature map.
+            t_emb: [B, T] time embedding.
+
+        Returns:
+            Tensor of shape [B, C, M].
+        """
         h = self.conv1(F.silu(self.norm1(x)))
         h = h + self.time_proj(t_emb).unsqueeze(-1)
         h = self.conv2(self.drop(F.silu(self.norm2(h))))
@@ -71,7 +84,7 @@ class DenoiserConfig:
     time_embed_dim: int = 256
     num_blocks: int = 12
     dropout: float = 0.0
-    cond_dim: int = 0
+    cond_dim: int = 0  # extra token-wise conditioning dimension
 
 
 class DiffusionDenoiserResNet1D(nn.Module):
@@ -80,9 +93,9 @@ class DiffusionDenoiserResNet1D(nn.Module):
     Inputs/outputs use token-major layout: [B, M, D].
     Internally uses Conv1d with channel-major layout: [B, C, M].
 
-    In this project, the network is treated as an x-prediction model:
-    - Input:  noisy latent x_t
-    - Output: clean latent x_0 prediction with the same shape
+    The model can optionally consume a token-wise conditioning tensor
+    `cond` of shape [B, M, cond_dim] which is projected and added to
+    the hidden representation.
     """
 
     def __init__(self, cfg: DenoiserConfig):
@@ -106,6 +119,7 @@ class DiffusionDenoiserResNet1D(nn.Module):
             self.cond_proj = nn.Linear(int(cfg.cond_dim), C)
 
         blocks = []
+        # Use a cycle of dilations to enlarge receptive field over tokens.
         dilations = [2 ** (i % 6) for i in range(int(cfg.num_blocks))]
         for d in dilations:
             blocks.append(
@@ -127,21 +141,22 @@ class DiffusionDenoiserResNet1D(nn.Module):
     ) -> torch.Tensor:
         """Forward pass.
 
-        xt:   [B, M, D] noisy latent x_t
-        t:    [B] integer time steps (0..T-1)
-        cond: optional conditioning tensor [B, M, C_cond]
-        mask: optional boolean mask [B, M] (True for valid tokens)
+        Args:
+            xt: [B, M, D] noised latents at step t.
+            t: [B] integer timesteps.
+            cond: optional token-wise conditioning of shape [B, M, cond_dim].
+                  This can encode things like length or geometry.
+            mask: optional boolean mask [B, M] where False marks padding tokens.
 
         Returns:
-            x0_pred: [B, M, D] clean latent prediction x_0.
+            Tensor of shape [B, M, D], same layout as xt.
         """
         if xt.dim() != 3:
             raise ValueError(f"xt must be [B,M,D], got {xt.shape}")
         B, M, D = xt.shape
 
-        if mask is not None:
-            if mask.shape != (B, M):
-                raise ValueError(f"mask must be [B,M]={B,M}, got {mask.shape}")
+        if mask is not None and mask.shape != (B, M):
+            raise ValueError(f"mask must be [B,M]={B,M}, got {mask.shape}")
 
         # Time embedding
         t_emb = sinusoidal_time_embedding(t, self.cfg.time_embed_dim)
@@ -151,20 +166,23 @@ class DiffusionDenoiserResNet1D(nn.Module):
         if mask is not None:
             x = x * mask[:, :, None].to(x.dtype)
 
-        # [B, M, D] -> [B, D, M]
+        # [B, M, D] -> [B, C, M]
         h = self.in_proj(x.transpose(1, 2))
 
-        # Optional per-token conditioning
+        # Optional conditioning: project and add to hidden channels
         if cond is not None and self.cond_proj is not None:
-            if cond.shape[:2] != (B, M):
-                raise ValueError(f"cond must be [B,M,*], got {cond.shape}")
-            c = self.cond_proj(cond).transpose(1, 2)
+            if cond.dim() != 3 or cond.shape[:2] != (B, M):
+                raise ValueError(
+                    f"cond must be [B,M,cond_dim], got {cond.shape}"
+                )
+            c = self.cond_proj(cond).transpose(1, 2)  # [B, C, M]
             h = h + c
 
+        # Residual blocks with time conditioning
         for blk in self.blocks:
             h = blk(h, t_emb)
 
-        out = self.out_proj(h).transpose(1, 2)  # [B,M,D]
+        out = self.out_proj(h).transpose(1, 2)  # [B, M, D]
         if mask is not None:
             out = out * mask[:, :, None].to(out.dtype)
         return out

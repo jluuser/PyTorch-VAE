@@ -77,34 +77,31 @@ However, currently using: /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTor
 
 ```bash
 python prior/sample_diffusion.py \
-  --ckpt /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/prior_ckpts/diffusion_prior/diffusion_prior_step190000.pt \
+  --ckpt /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/prior/prior_ckpts/diffusion_prior_1_15/diffusion_prior_step70000.pt \
   --config prior/configs/diffusion_config.yaml \
-  --vq_ckpt /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/checkpoints/vq_token64_K1024_D512_ResidualVQ_fromscratch/epochepoch=139.ckpt \
+  --vq_ckpt checkpoints/vq_token64_K1024_D512_ResidualVQ_fromscratch/epochepoch=139.ckpt \
   --vq_yaml configs/stage2_vq.yaml \
-  --num_samples 5 \
+  --num_samples 10 \
   --batch_size 16 \
   --sample_steps 100 \
-  --target_len 350 \
+  --target_len 0 \
   --seed 42 \
-  --out_dir /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/prior/diffusion_prior_samples_step190000\
+  --out_dir prior/diffusion_prior_samples_step70000 \
   --device cuda
 
 ```
 
 ## Step 4: Decode generated codes into curves using VQVAE
 
-Script: `scripts/decode_indices_with_vqvae.py` (remains unchanged)
-Input: `samples_manifest.jsonl` generated in Step 3
-Output: `*_recon.npy` inside `prior_recons/`, where each file is an `[L,C]` reconstructed curve.
-
 ```bash
-python scripts/decode_indices_with_vqvae.py \
-  --vq_ckpt  /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/checkpoints/vq_token64_K1024_D512_ResidualVQ_fromscratch/epochepoch=139.ckpt \
-  --vq_yaml  /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/configs/stage2_vq.yaml \
-  --samples_manifest /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/prior/diffusion_prior_samples_step190000/samples_manifest.jsonl \
-  --out_dir /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/prior/diffusion_prior_recons_step190000 \
-  --check_latent_len 64 \
-  --device cuda
+python scripts/decode_with_vqvae.py \
+  --vq_ckpt checkpoints/vq_token64_K1024_D512_ResidualVQ_fromscratch/epochepoch=139.ckpt \
+  --vq_yaml configs/stage2_vq.yaml \
+  --samples_manifest prior/diffusion_prior_samples_step70000/samples_manifest.jsonl \
+  --out_dir prior/diffusion_prior_samples_step70000/redecoded \
+  --device cuda \
+  --limit 0 \
+  --check_latent_len 0
 ```
 ## Step 5: filter
 

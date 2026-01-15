@@ -11,9 +11,8 @@ import argparse
 import json
 import math
 import os
-from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
 import numpy as np
 import torch
@@ -21,7 +20,6 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
-
 import yaml
 
 from prior.datasets.diffusion_dataset import DiffusionIndexDataset, collate_pad
@@ -86,7 +84,15 @@ def get_device(cfg_runtime: Dict[str, Any]) -> torch.device:
 
 @torch.no_grad()
 def _geo_to_token_cond(geo_flat: torch.Tensor, num_q: int) -> torch.Tensor:
-    """geo_flat: [B, L_flat, G] -> geo_tok: [B, M, G]"""
+    """Convert per-flat-position geo features to per-token features.
+
+    Args:
+        geo_flat: [B, L_flat, G] per-position geometry.
+        num_q: number of quantizers in RVQ.
+
+    Returns:
+        geo_tok: [B, M, G] per-token geometry, averaged over residual levels.
+    """
     if geo_flat.dim() != 3:
         raise ValueError(f"geo must be [B,L,G], got {geo_flat.shape}")
     B, L, G = geo_flat.shape
@@ -98,6 +104,41 @@ def _geo_to_token_cond(geo_flat: torch.Tensor, num_q: int) -> torch.Tensor:
     M = L // num_q
     geo = geo_flat.view(B, M, num_q, G).mean(dim=2)
     return geo
+
+
+@torch.no_grad()
+def _build_length_condition(
+    target_len: torch.Tensor,
+    num_tokens: int,
+    max_target_len: int,
+    cond_dim: int,
+) -> Optional[torch.Tensor]:
+    """Build per-token length conditioning tensor.
+
+    Args:
+        target_len: [B] integer sequence lengths in original curve space.
+        num_tokens: M, latent token count.
+        max_target_len: global max length used for normalization.
+        cond_dim: feature dimension for length condition.
+
+    Returns:
+        Tensor of shape [B, M, cond_dim] or None if cond_dim <= 0.
+    """
+    cond_dim = int(cond_dim)
+    if cond_dim <= 0:
+        return None
+
+    max_len = float(max(1, int(max_target_len)))
+    len_clamped = target_len.clamp(min=1)
+    len_norm = (len_clamped.float() / max_len).unsqueeze(-1)  # [B, 1]
+
+    if cond_dim == 1:
+        len_feat = len_norm  # [B, 1]
+    else:
+        len_feat = len_norm.repeat(1, cond_dim)  # [B, cond_dim]
+
+    cond = len_feat.unsqueeze(1).expand(-1, num_tokens, -1)  # [B, M, cond_dim]
+    return cond
 
 
 def build_optimizer(model: nn.Module, cfg_optim: Dict[str, Any]) -> torch.optim.Optimizer:
@@ -113,10 +154,7 @@ def lr_warmup_cosine(step: int, warmup: int, total: int, base_lr: float) -> floa
     total = max(1, int(total))
     if warmup > 0 and step < warmup:
         return base_lr * float(step + 1) / float(warmup)
-    progress = min(
-        1.0,
-        max(0.0, float(step - warmup) / float(max(1, total - warmup))),
-    )
+    progress = min(1.0, max(0.0, float(step - warmup) / float(max(1, total - warmup))))
     return base_lr * 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
@@ -140,11 +178,33 @@ def save_ckpt(
     torch.save(obj, str(path))
 
 
-def load_ckpt(path: str, device: torch.device) -> Dict[str, Any]:
+def load_ckpt(path: str) -> Dict[str, Any]:
     obj = torch.load(path, map_location="cpu")
     if isinstance(obj, dict) and "model" in obj:
         return obj
     raise RuntimeError(f"invalid ckpt: {path}")
+
+
+def _normalize_zq(
+    zq: torch.Tensor,
+    zq_mean: Optional[torch.Tensor],
+    zq_std: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Normalize z_q using precomputed mean/std if available.
+
+    Args:
+        zq: [B, M, D] latent vectors.
+        zq_mean: [D] or None.
+        zq_std: [D] or None.
+
+    Returns:
+        Normalized z_q with same shape as input.
+    """
+    if zq_mean is None or zq_std is None:
+        return zq
+    mean = zq_mean.view(1, 1, -1).to(zq.device)
+    std = torch.clamp(zq_std.view(1, 1, -1).to(zq.device), min=1e-6)
+    return (zq - mean) / std
 
 
 @torch.no_grad()
@@ -157,10 +217,13 @@ def evaluate(
     loader: DataLoader,
     device: torch.device,
     use_geo: bool,
-    zq_mean: torch.Tensor,
-    zq_std: torch.Tensor,
-):
-    """Eval loop: compute average diffusion loss on validation set."""
+    use_length_cond: bool,
+    max_target_len: int,
+    length_cond_dim: int,
+    zq_mean: Optional[torch.Tensor],
+    zq_std: Optional[torch.Tensor],
+) -> float:
+    """Evaluate diffusion loss on a validation set."""
     model.eval()
     losses = []
     for batch in loader:
@@ -168,38 +231,39 @@ def evaluate(
         mask_flat = batch["mask"].to(device)
 
         z0, token_mask = indices_to_latent_sum(
-            vq_codebook,
-            indices,
-            num_quantizers=num_q,
-            pad_id=pad_id,
-            return_token_mask=True,
+            vq_codebook, indices, num_quantizers=num_q, pad_id=pad_id, return_token_mask=True
         )
         z0 = z0.to(device)
         if token_mask is not None:
             token_mask = token_mask.to(device)
 
-        # Normalize z_q using precomputed mean/std
-        z0 = (z0 - zq_mean.view(1, 1, -1)) / zq_std.view(1, 1, -1)
+        # Normalize z_q before feeding into diffusion
+        z0_norm = _normalize_zq(z0, zq_mean, zq_std)
 
-        cond = None
+        geo_tok = None
         if use_geo and ("geo" in batch):
             geo = batch["geo"].to(device)
-            cond = _geo_to_token_cond(geo, num_q=num_q)
+            geo_tok = _geo_to_token_cond(geo, num_q=num_q)
 
-        t = torch.randint(
-            0,
-            diffusion.num_steps,
-            (z0.size(0),),
-            device=device,
-            dtype=torch.long,
-        )
-        loss = diffusion.training_loss(
-            model,
-            z0,
-            t=t,
-            cond=cond,
-            mask=token_mask,
-        )
+        length_cond = None
+        if use_length_cond:
+            target_len = batch["target_len"].to(device)
+            length_cond = _build_length_condition(
+                target_len,
+                num_tokens=z0.size(1),
+                max_target_len=max_target_len,
+                cond_dim=length_cond_dim,
+            )
+
+        cond_parts = []
+        if geo_tok is not None:
+            cond_parts.append(geo_tok)
+        if length_cond is not None:
+            cond_parts.append(length_cond)
+        cond = torch.cat(cond_parts, dim=-1) if cond_parts else None
+
+        t = torch.randint(0, diffusion.num_steps, (z0.size(0),), device=device, dtype=torch.long)
+        loss = diffusion.training_loss(model, z0_norm, t=t, cond=cond, mask=token_mask)
         losses.append(float(loss.item()))
 
     model.train()
@@ -213,9 +277,7 @@ def main():
     ap.add_argument(
         "--config",
         type=str,
-        default=str(
-            Path(__file__).resolve().parent / "configs" / "diffusion_prior.yaml"
-        ),
+        default=str(Path(__file__).resolve().parent / "configs" / "diffusion_prior.yaml"),
     )
     ap.add_argument("--resume", type=str, default="")
     ap.add_argument("--vq_ckpt", type=str, default="")
@@ -252,7 +314,6 @@ def main():
     if not vq_ckpt or not vq_yaml:
         raise RuntimeError("config.vq must include ckpt and yaml")
 
-    # Load VQ-VAE
     vq_exp = load_vq_experiment(vq_ckpt, vq_yaml, device)
     vq_core = core_model(vq_exp)
     vq_info = get_vq_info(vq_core)
@@ -265,25 +326,33 @@ def main():
     num_q = int(vq_info.num_quantizers)
     pad_id = int(cfg_data.get("pad_token_id", vq_info.K_total))
 
-    # Load z_q normalization stats
-    stats_path = str(cfg_runtime.get("zq_stats_path", "")).strip()
-    if not stats_path:
-        raise RuntimeError("runtime.zq_stats_path is required in config")
-    stats_path = str(Path(stats_path).expanduser())
-    if not Path(stats_path).is_file():
-        raise FileNotFoundError(f"z_q stats file not found: {stats_path}")
-    stats = np.load(stats_path)
-    mean_np = stats["mean"].astype("float32")
-    std_np = stats["std"].astype("float32")
-    zq_mean = torch.from_numpy(mean_np).to(device)
-    zq_std = torch.from_numpy(std_np).to(device)
-    zq_std = torch.clamp(zq_std, min=1e-6)
-
     max_len = cfg_data.get("max_len", None)
     batch_size = int(cfg_data.get("batch_size", 64))
     num_workers = int(cfg_data.get("num_workers", 4))
     use_geo = bool(cfg_data.get("use_geo", False))
     geo_dim = int(cfg_data.get("geo_dim", 0))
+    use_length_cond = bool(cfg_data.get("use_length_cond", True))
+    max_target_len = int(cfg_data.get("max_target_len", 350))
+    length_cond_dim = int(cfg_model.get("length_cond_dim", 1)) if use_length_cond else 0
+
+    # Load z_q statistics if provided
+    zq_stats_path = str(cfg_runtime.get("zq_stats_path", ""))
+    zq_mean: Optional[torch.Tensor] = None
+    zq_std: Optional[torch.Tensor] = None
+    if zq_stats_path:
+        stats = np.load(zq_stats_path)
+        if "mean" not in stats or "std" not in stats:
+            raise RuntimeError(
+                f"zq_stats_path={zq_stats_path} must contain 'mean' and 'std' arrays"
+            )
+        zq_mean = torch.from_numpy(stats["mean"].astype(np.float32))
+        zq_std = torch.from_numpy(stats["std"].astype(np.float32))
+        if zq_mean.numel() != int(vq_info.code_dim):
+            raise RuntimeError(
+                f"zq_stats dim {zq_mean.numel()} != code_dim {vq_info.code_dim}"
+            )
+        if rank == 0:
+            print(f"[zq_stats] loaded mean/std from {zq_stats_path}")
 
     train_ds = DiffusionIndexDataset(
         cfg_data["train_manifest"],
@@ -321,7 +390,10 @@ def main():
         pin_memory=bool(cfg_data.get("pin_memory", True)),
         drop_last=False,
         collate_fn=lambda b: collate_pad(
-            b, pad_id=pad_id, geo_dim=geo_dim, multiple_of=num_q
+            b,
+            pad_id=pad_id,
+            geo_dim=geo_dim,
+            multiple_of=num_q,
         ),
         persistent_workers=bool(num_workers > 0),
     )
@@ -336,12 +408,14 @@ def main():
             pin_memory=bool(cfg_data.get("pin_memory", True)),
             drop_last=False,
             collate_fn=lambda b: collate_pad(
-                b, pad_id=pad_id, geo_dim=geo_dim, multiple_of=num_q
+                b,
+                pad_id=pad_id,
+                geo_dim=geo_dim,
+                multiple_of=num_q,
             ),
             persistent_workers=bool(num_workers > 0),
         )
 
-    # Diffusion schedule (betas)
     schedule = DiffusionSchedule.build(
         num_steps=int(cfg_diff.get("num_steps", 1000)),
         schedule=str(cfg_diff.get("schedule", "cosine")),
@@ -351,14 +425,14 @@ def main():
     )
     diffusion = GaussianDiffusion(betas=schedule.betas).to(device)
 
-    # Denoiser model (x-prediction)
+    cond_dim = (geo_dim if use_geo else 0) + length_cond_dim
     den_cfg = DenoiserConfig(
         code_dim=int(vq_info.code_dim),
         hidden_channels=int(cfg_model.get("hidden_channels", 256)),
         time_embed_dim=int(cfg_model.get("time_embed_dim", 256)),
         num_blocks=int(cfg_model.get("num_blocks", 12)),
         dropout=float(cfg_model.get("dropout", 0.0)),
-        cond_dim=int(geo_dim if use_geo else 0),
+        cond_dim=int(cond_dim),
     )
     model = DiffusionDenoiserResNet1D(den_cfg).to(device)
 
@@ -381,7 +455,7 @@ def main():
 
     start_step = 0
     if args.resume:
-        ckpt = load_ckpt(args.resume, device=device)
+        ckpt = load_ckpt(args.resume)
         (model.module if isinstance(model, DDP) else model).load_state_dict(
             ckpt["model"], strict=True
         )
@@ -392,7 +466,7 @@ def main():
         if rank == 0:
             print(f"[resume] step={start_step} from {args.resume}")
 
-    max_updates = int(cfg_optim.get("max_updates", 200000))
+    max_updates = int(cfg_optim.get("max_updates", 80000))
     warmup = int(cfg_optim.get("warmup_updates", 2000))
     grad_clip = float(cfg_optim.get("grad_clip_norm", 1.0))
     base_lr = float(cfg_optim.get("lr", 2e-4))
@@ -400,7 +474,7 @@ def main():
     log_interval = int(cfg_runtime.get("log_interval", 100))
     eval_interval = int(cfg_runtime.get("eval_interval_updates", 2000))
     save_interval = int(cfg_runtime.get("save_interval_updates", 10000))
-    ckpt_dir = Path(str(cfg_runtime.get("ckpt_dir", "prior_ckpts/diffusion_prior")))
+    ckpt_dir = Path(str(cfg_runtime.get("ckpt_dir", "prior/prior_ckpts/diffusion_prior")))
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     if rank == 0:
@@ -411,7 +485,6 @@ def main():
             "code_dim": int(vq_info.code_dim),
             "num_quantizers": int(num_q),
             "pad_token_id": int(pad_id),
-            "zq_stats_path": stats_path,
         }
         with (ckpt_dir / "train_meta.json").open("w") as f:
             json.dump(meta, f, indent=2)
@@ -444,17 +517,32 @@ def main():
         if token_mask is not None:
             token_mask = token_mask.to(device)
 
-        # Normalize z_q before diffusion
-        z0 = (z0 - zq_mean.view(1, 1, -1)) / zq_std.view(1, 1, -1)
+        # Normalize z_q before feeding into diffusion
+        z0_norm = _normalize_zq(z0, zq_mean, zq_std)
 
-        cond = None
+        geo_tok = None
         if use_geo and ("geo" in batch):
             geo = batch["geo"].to(device, non_blocking=True)
-            cond = _geo_to_token_cond(geo, num_q=num_q)
+            geo_tok = _geo_to_token_cond(geo, num_q=num_q)
 
-        t = torch.randint(
-            0, diffusion.num_steps, (z0.size(0),), device=device, dtype=torch.long
-        )
+        length_cond = None
+        if use_length_cond:
+            target_len = batch["target_len"].to(device, non_blocking=True)
+            length_cond = _build_length_condition(
+                target_len,
+                num_tokens=z0.size(1),
+                max_target_len=max_target_len,
+                cond_dim=length_cond_dim,
+            )
+
+        cond_parts = []
+        if geo_tok is not None:
+            cond_parts.append(geo_tok)
+        if length_cond is not None:
+            cond_parts.append(length_cond)
+        cond = torch.cat(cond_parts, dim=-1) if cond_parts else None
+
+        t = torch.randint(0, diffusion.num_steps, (z0.size(0),), device=device, dtype=torch.long)
 
         lr = lr_warmup_cosine(step, warmup=warmup, total=max_updates, base_lr=base_lr)
         for pg in optimizer.param_groups:
@@ -463,13 +551,7 @@ def main():
         optimizer.zero_grad(set_to_none=True)
 
         with torch.cuda.amp.autocast(enabled=use_amp):
-            loss = diffusion.training_loss(
-                model,
-                z0,
-                t=t,
-                cond=cond,
-                mask=token_mask,
-            )
+            loss = diffusion.training_loss(model, z0_norm, t=t, cond=cond, mask=token_mask)
 
         scaler.scale(loss).backward()
 
@@ -494,13 +576,9 @@ def main():
             to_save = model.module if isinstance(model, DDP) else model
             save_ckpt(ckpt_path, to_save, optimizer, step, cfg, ema=ema)
 
-        if (
-            rank == 0
-            and val_loader is not None
-            and (eval_interval > 0)
-            and (step > 0)
-            and (step % eval_interval == 0)
-        ):
+        if rank == 0 and val_loader is not None and (eval_interval > 0) and (
+            step > 0
+        ) and (step % eval_interval == 0):
             to_eval = model.module if isinstance(model, DDP) else model
             if ema is not None:
                 backup = {k: v.detach().clone() for k, v in to_eval.state_dict().items()}
@@ -514,6 +592,9 @@ def main():
                     val_loader,
                     device,
                     use_geo=use_geo,
+                    use_length_cond=use_length_cond,
+                    max_target_len=max_target_len,
+                    length_cond_dim=length_cond_dim,
                     zq_mean=zq_mean,
                     zq_std=zq_std,
                 )
@@ -528,6 +609,9 @@ def main():
                     val_loader,
                     device,
                     use_geo=use_geo,
+                    use_length_cond=use_length_cond,
+                    max_target_len=max_target_len,
+                    length_cond_dim=length_cond_dim,
                     zq_mean=zq_mean,
                     zq_std=zq_std,
                 )
