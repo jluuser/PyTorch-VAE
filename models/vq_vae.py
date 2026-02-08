@@ -398,6 +398,8 @@ class VQVAE(nn.Module):
         tokenizer_heads: int = 8,
         tokenizer_layers: int = 2,
         tokenizer_dropout: float = 0.1,
+        latent_sigmoid: bool = False,
+        latent_sigmoid_ae_only: bool = True,
         reinit_dead_codes: bool = True,
         reinit_prob: float = 1.0,
         dead_usage_threshold: int = 0,
@@ -489,7 +491,8 @@ class VQVAE(nn.Module):
             n_layers=int(tokenizer_layers),
             dropout=float(tokenizer_dropout),
         )
-
+        self.latent_sigmoid = bool(latent_sigmoid)
+        self.latent_sigmoid_ae_only = bool(latent_sigmoid_ae_only)
         fuse_in = self.hidden_dim * 2
         self.fuse_mlp = nn.Sequential(
             nn.Linear(fuse_in, self.hidden_dim),
@@ -734,6 +737,9 @@ class VQVAE(nn.Module):
         kpm = (~mask) if mask is not None else None
         h_mem = self.tokenizer(h_tokens, key_padding_mask=kpm)
         z_e_tokens = self.to_code(h_mem)
+        if self.latent_sigmoid:
+            if (not self.latent_sigmoid_ae_only) or (not self.use_vq):
+                z_e_tokens = torch.sigmoid(z_e_tokens)
         return z_e_tokens
 
     def decode(self, z_for_decode: Tensor, mask: Optional[Tensor] = None) -> Tensor:

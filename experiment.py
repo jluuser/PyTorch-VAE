@@ -104,7 +104,10 @@ class VQVAEExperiment(pl.LightningModule):
             "lr_max_offsets": float(exp_params.get("lr_max_offsets", 8)),
         }
 
-        self.example_input_array = (torch.zeros(1, 64, 6), torch.ones(1, 64, dtype=torch.bool))
+        self.example_input_array = (
+            torch.zeros(1, 64, 6, dtype=torch.float32),
+            torch.ones(1, 64, dtype=torch.bool),
+        )
 
         torch.manual_seed(self.manual_seed)
         self.train_dataset = None
@@ -330,7 +333,7 @@ class VQVAEExperiment(pl.LightningModule):
 
         if "beta" in self.current_weights:
             self.model.beta = float(self.current_weights["beta"])
-            if hasattr(self.model, "quantizer"):
+            if getattr(self.model, "quantizer", None) is not None:
                 self.model.quantizer.beta = float(self.model.beta)
 
         if "LR" in new_vals:

@@ -13,10 +13,10 @@ Usage examples:
       --config configs/stage2_vq.yaml \
       --warm_start_ckpt /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/checkpoints/ae_1024_512_residualVQ/last.ckpt \
       --init_codebook scripts/kmeans_residual_centroids_L4x1024x512.npy
+
   python run.py \
-  --config configs/stage2_vq.yaml \
-  --warm_start_ckpt /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/checkpoints/vq_token64_K1024/epochepoch=009.ckpt
-    
+      --config configs/stage2_vq.yaml \
+      --warm_start_ckpt /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/checkpoints/vq_token64_K1024/epochepoch=009.ckpt
 
   # Resume from a previous full checkpoint (optimizer, schedulers, etc.)
   # When --resume_ckpt is provided, warm-start and codebook init are skipped.
@@ -79,10 +79,10 @@ def maybe_init_codebook(model: torch.nn.Module, path: str):
     if not path or not os.path.isfile(path):
         print(f"[Codebook init] skipped (invalid path: {path})")
         return
+    # Use float32 centroids; the model will internally cast them
     C = np.load(path).astype(np.float32)
     C = torch.from_numpy(C)
     device = next(model.parameters()).device
-    # Defer actual copy to the model's method (it sets embedding and EMA buffers).
     if not hasattr(model, "init_codebook_from_centroids"):
         raise AttributeError("Model does not implement init_codebook_from_centroids(tensor).")
     model.init_codebook_from_centroids(C.to(device))
@@ -133,11 +133,10 @@ def main():
             raise FileNotFoundError(f"[Resume] ckpt not found: {args.resume_ckpt}")
         print(f"[Resume] Will resume full state from: {args.resume_ckpt}")
 
-        # Strongly disable warm-start from YAML when resuming
-        # so experiment.on_fit_start will not try to warm-start.
+        # Disable warm-start from YAML when resuming
         experiment.exp_params["warm_start_ckpt"] = ""
     else:
-        # Resolve warm_start_ckpt: CLI has priority, otherwise YAML exp_params
+        # Warm start (Stage1 -> Stage2)
         warm_start_path = args.warm_start_ckpt or exp_params.get("warm_start_ckpt", "")
         if warm_start_path:
             try:
@@ -147,7 +146,7 @@ def main():
         else:
             print("[Warm-start] skipped (no warm_start_ckpt provided).")
 
-        # Codebook init: CLI has priority, otherwise YAML model_params.codebook_init_path
+        # Codebook init (for VQ stage)
         codebook_path = args.init_codebook or model_params.get("codebook_init_path", "")
         if model_params.get("use_vq", True) and codebook_path:
             try:
@@ -157,18 +156,20 @@ def main():
         else:
             print("[Codebook init] skipped (use_vq=False or no path provided).")
 
+        model = model.to(torch.float32)
+        experiment.model = model
+        print("[Precision] Converted model parameters/buffers to float32 (double).")
+
     # -----------------------------------------------------------------------
     # Logging and checkpoint callbacks
     # -----------------------------------------------------------------------
     log_dir = Path(logging_params.get("save_dir", "./logs"))
     logger_name = logging_params.get("name", model_params.get("name", "VQVAE"))
     if is_resume:
-        # Mark resume runs in logger name for clarity
         logger_name = f"{logger_name}-resume"
     logger = TensorBoardLogger(save_dir=str(log_dir), name=logger_name)
 
-    # Checkpoint directory (default matches user's prior folder)
-    ckpt_dir = Path(exp_params.get("checkpoint_dir", "./checkpoints/ae_1024_512_residualVQ"))
+    ckpt_dir = Path(exp_params.get("checkpoint_dir", "./checkpoints/aeot_sigmoid"))
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     # Save every N epochs and keep all
@@ -211,7 +212,6 @@ def main():
 
     start_time = time.time()
 
-    # Important: pass resume checkpoint to fit via ckpt_path.
     if is_resume:
         trainer.fit(experiment, ckpt_path=args.resume_ckpt)
     else:

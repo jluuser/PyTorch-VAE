@@ -6,6 +6,9 @@ logs/
 latent_analysis/
 pdb_length_analysis/
 prior/out_prior_data/
+latent_analysis_ae/
+latent_analysis_ae_sigmoid/
+results/
 
 # Experiment outputs
 VanillaVAE/version_0/

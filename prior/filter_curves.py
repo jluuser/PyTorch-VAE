@@ -7,10 +7,8 @@ Filter decoded protein curves by geometric and secondary-structure heuristics.
 Typical usage:
 
 python prior/filter_curves.py \
-  --recon_dir /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/prior/diffusion_prior_samples_step70001/curves_npy \
-  --out_dir /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/prior/diffusion_prior_samples_step70001/curves_npy_filtered \
-  --samples_manifest /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/prior/diffusion_prior_samples_step70001/samples_manifest.jsonl \
-  --filtered_manifest_out /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/prior/diffusion_prior_samples_step70001/filtered_manifest.jsonl \
+  --recon_dir /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/results/decoded_npy_122_sigmoid \
+  --out_dir /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/results/decoded_npy_122_sigmoid_filtered \
   --min_pairwise_dist 2.0 \
   --neighbor_exclude 2 \
   --min_beta_run 0 \
@@ -543,8 +541,8 @@ def main():
     n_ss_reject = 0
 
     # Hard thresholds (can be adjusted here if needed)
-    BOND_MIN_ALLOWED = 1.0
-    BOND_MAX_ALLOWED = 9.5
+    BOND_MIN_ALLOWED = 2.2
+    BOND_MAX_ALLOWED = 7.5
     BOND_GOOD_MIN = 2.0
     BOND_GOOD_MAX = 7.2
     BOND_FRAC_OUT_MAX = 0.90

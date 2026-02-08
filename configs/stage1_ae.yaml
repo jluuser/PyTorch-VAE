@@ -6,10 +6,10 @@ model_params:
   num_heads: 8
   max_seq_len: 350
   use_vq: false
-  codebook_size: 1024
-  code_dim: 512
+  codebook_size: 512
+  code_dim: 128
   beta: 0.0
-  latent_tokens: 64
+  latent_tokens: 48
   tokenizer_heads: 8
   tokenizer_layers: 2
   tokenizer_dropout: 0.1
@@ -26,6 +26,9 @@ model_params:
   reinit_prob: 0.0
   dead_usage_threshold: 0
   codebook_init_path: ""
+  latent_sigmoid: true
+  latent_sigmoid_ae_only: true
+
 
 data_params:
   npy_dir: "/public/home/zhangyangroup/chengshiz/keyuan.zhou/prp-dataset/filtered_curves_npy/"
@@ -47,7 +50,7 @@ exp_params:
   dir_weight: 0.0
   dih_weight: 0.0
   rmsd_weight: 1.0
-  print_every: 600
+  print_every: 6000
   schedules:
     bond_length_weight: [[0, 0.000], [5, 0.000], [12, 0.000], [25, 0.000]]
     bond_angle_weight: [[0, 0.000], [5, 0.000], [12, 0.000], [25, 0.000]]
@@ -69,7 +72,7 @@ trainer_params:
   devices: 4
   strategy: ddp
   precision: 32
-  max_epochs: 80
+  max_epochs: 90
   log_every_n_steps: 10
   num_sanity_val_steps: 0
   benchmark: true

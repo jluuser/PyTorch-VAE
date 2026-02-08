@@ -2,7 +2,25 @@
 # coding: utf-8
 """
 Extract fixed-N code indices (N tokens) from a trained VQVAE for prior training.
-Also exports per-latent geometry descriptors aligned with the code indices.
+Also exports continuous encoder latents z_e and per-latent geometry descriptors.
+
+Outputs (per sample):
+  - indices_npy/sid.npy         : flattened RVQ indices [N_flat]
+  - ze_npy/sid_ze.npy           : encoder latents z_e [M, D]
+  - geo_npy/sid_geo.npy         : per-flat-position geometry [N_flat, G]
+  - manifest.jsonl              : JSON lines with fields:
+        {
+          "id": ...,
+          "indices_path": ...,
+          "latent_path": ...,
+          "latent_len": N_flat,
+          "latent_tokens": M,
+          "target_len": L,
+          "dtype": "int16"/"int32",
+          "rank": ...,
+          "geo_path": ...,
+          "geo_dim": ...
+        }
 """
 
 import os
@@ -11,7 +29,7 @@ import json
 import argparse
 import hashlib
 from pathlib import Path
-from typing import Tuple, List, Optional
+from typing import Tuple, List, Optional, Dict, Any
 
 import numpy as np
 import torch
@@ -68,7 +86,7 @@ def ensure_dir(p: Path):
 
 
 def parse_args():
-    ap = argparse.ArgumentParser(description="Extract VQ indices for prior.")
+    ap = argparse.ArgumentParser(description="Extract VQ indices and encoder latents (z_e) for prior.")
     ap.add_argument("--ckpt", type=str, required=True)
     ap.add_argument("--yaml", type=str, required=True)
     ap.add_argument("--out_dir", type=str, required=True)
@@ -118,10 +136,10 @@ def build_dataloader(exp, split: str, num_workers: int, pin_memory: bool):
             dataset,
             num_replicas=get_world_size(),
             rank=get_rank(),
-            shuffle=True
+            shuffle=True,
         )
         dl = DataLoader(
-           dataset,
+            dataset,
             batch_size=dl.batch_size,
             sampler=sampler,
             num_workers=num_workers if num_workers is not None else dl.num_workers,
@@ -129,7 +147,7 @@ def build_dataloader(exp, split: str, num_workers: int, pin_memory: bool):
             drop_last=False,
             collate_fn=dl.collate_fn,
             persistent_workers=bool(num_workers and num_workers > 0),
-            worker_init_fn=getattr(dl, "worker_init_fn", None)
+            worker_init_fn=getattr(dl, "worker_init_fn", None),
         )
     else:
         sampler = None
@@ -142,12 +160,14 @@ def _fallback_tokenize(core, features: torch.Tensor, mask: torch.Tensor) -> torc
     """
     Fallback path: old-style encode -> tokenizer -> to_code.
     features: [B, L, H]
+    Returns:
+        z_e: [B, M, D]
     """
     if not hasattr(core, "tokenizer") or not hasattr(core, "to_code"):
         raise RuntimeError("encode() returned [B,L,H] but model has no tokenizer/to_code.")
     kpm = (~mask) if mask is not None else None
-    h_mem = core.tokenizer(features, key_padding_mask=kpm)  # [B, N, H]
-    z_e = core.to_code(h_mem)  # [B, N, D]
+    h_mem = core.tokenizer(features, key_padding_mask=kpm)  # [B, M, H]
+    z_e = core.to_code(h_mem)  # [B, M, D]
     return z_e
 
 
@@ -182,13 +202,11 @@ def _ensure_batch_first_2d(
         M = N_flat // base
 
         if latent_tokens is not None and M != int(latent_tokens):
-            print(
-                f"[warn] RVQ inferred tokens={M} != latent_tokens={latent_tokens}"
-            )
+            print(f"[warn] RVQ inferred tokens={M} != latent_tokens={latent_tokens}")
 
-        idx = indices.view(num_quantizers, B, M)      # [Q, B, M]
-        idx = idx.permute(1, 2, 0).contiguous()       # [B, M, Q]
-        return idx.view(B, M * num_quantizers)        # [B, M*Q]
+        idx = indices.view(num_quantizers, B, M)  # [Q, B, M]
+        idx = idx.permute(1, 2, 0).contiguous()   # [B, M, Q]
+        return idx.view(B, M * num_quantizers)    # [B, M*Q]
 
     if indices.dim() == 2:
         if indices.size(0) == B:
@@ -229,7 +247,19 @@ def _ensure_batch_first_2d(
 
 
 @torch.no_grad()
-def tokenize_and_quantize(core, x: torch.Tensor, mask: torch.Tensor) -> Tuple[torch.Tensor, np.ndarray]:
+def tokenize_and_quantize(
+    core,
+    x: torch.Tensor,
+    mask: torch.Tensor,
+) -> Tuple[torch.Tensor, np.ndarray, torch.Tensor]:
+    """
+    Run encoder to obtain encoder latents z_e and quantized indices.
+
+    Returns:
+        indices: [B, N_flat]
+        lengths: [B] (original curve lengths in residue space)
+        z_e:     [B, M, D] encoder latents (pre-quantization)
+    """
     dev = next(core.parameters()).device
     x = x.to(dev, non_blocking=True)
     mask = mask.to(dev, non_blocking=True)
@@ -247,55 +277,39 @@ def tokenize_and_quantize(core, x: torch.Tensor, mask: torch.Tensor) -> Tuple[to
         latent_tokens = getattr(core, "latent_tokens", None)
 
     num_quantizers = int(getattr(q, "num_quantizers", 1))
+    if num_quantizers <= 0:
+        num_quantizers = 1
 
-    indices: torch.Tensor
-
+    # Find 3D float features from encode output
     if isinstance(enc_out, (tuple, list)):
-        cand_idx = None
+        feats = None
         for item in enc_out:
-            if torch.is_tensor(item) and item.dtype in (torch.int64, torch.int32):
-                if item.dim() >= 1:
-                    cand_idx = item
-                    break
-        if cand_idx is not None:
-            indices = cand_idx.long()
-        else:
-            if not torch.is_tensor(enc_out[0]):
-                raise RuntimeError("encode() output[0] must be a tensor.")
-            feats = enc_out[0]
-            if feats.dim() != 3:
-                raise RuntimeError("encode()[0] tensor must be [B, T, D].")
-            B, T, _ = feats.shape
-
-            if latent_tokens is not None and T == int(latent_tokens):
-                z_e = feats
-            else:
-                z_e = _fallback_tokenize(core, feats, mask)
-
-            q_out = q(z_e, do_ema_update=False, allow_reinit=False, mask=None)
-            if isinstance(q_out, (tuple, list)) and len(q_out) >= 3:
-                indices = q_out[2]
-            elif torch.is_tensor(q_out):
-                indices = q_out
-            else:
-                raise RuntimeError("Unsupported quantizer output type.")
+            if torch.is_tensor(item) and item.dim() == 3 and item.dtype.is_floating_point:
+                feats = item
+                break
+        if feats is None:
+            raise RuntimeError("encode() did not return 3D float features for z_e extraction.")
     else:
         feats = enc_out
-        if not torch.is_tensor(feats) or feats.dim() != 3:
-            raise RuntimeError("encode() tensor output must be [B, T, D].")
-        B, T, _ = feats.shape
-        if latent_tokens is not None and T == int(latent_tokens):
-            z_e = feats
-        else:
-            z_e = _fallback_tokenize(core, feats, mask)
 
-        q_out = q(z_e, do_ema_update=False, allow_reinit=False, mask=None)
-        if isinstance(q_out, (tuple, list)) and len(q_out) >= 3:
-            indices = q_out[2]
-        elif torch.is_tensor(q_out):
-            indices = q_out
-        else:
-            raise RuntimeError("Unsupported quantizer output type.")
+    if not torch.is_tensor(feats) or feats.dim() != 3:
+        raise RuntimeError("encode() tensor output must be [B, T, D].")
+    B, T, _ = feats.shape
+
+    # Obtain encoder latents z_e
+    if latent_tokens is not None and T == int(latent_tokens):
+        z_e = feats
+    else:
+        z_e = _fallback_tokenize(core, feats, mask)  # [B, M, D]
+
+    # Quantize z_e to obtain indices
+    q_out = q(z_e, do_ema_update=False, allow_reinit=False, mask=None)
+    if isinstance(q_out, (tuple, list)) and len(q_out) >= 3:
+        indices = q_out[2]
+    elif torch.is_tensor(q_out):
+        indices = q_out
+    else:
+        raise RuntimeError("Unsupported quantizer output type.")
 
     indices = _ensure_batch_first_2d(
         indices,
@@ -305,7 +319,7 @@ def tokenize_and_quantize(core, x: torch.Tensor, mask: torch.Tensor) -> Tuple[to
     )
 
     lengths = mask.sum(dim=1).long().cpu().numpy()
-    return indices, lengths
+    return indices, lengths, z_e
 
 
 def compute_latent_geometry_for_sample(
@@ -322,11 +336,11 @@ def compute_latent_geometry_for_sample(
         coords: [L, 3] array of backbone coordinates.
         ss: [L, C] array of secondary-structure one-hot or similar.
         valid_len: number of valid residues (L).
-        num_codes: total number of latent codes (flattened RVQ, N).
+        num_codes: total number of latent codes (flattened RVQ, N_flat).
         num_quantizers: number of RVQ levels (Q).
 
     Returns:
-        geo_flat: [N, D_geo] float32 array.
+        geo_flat: [N_flat, D_geo] float32 array.
     """
     L = int(valid_len)
     if L <= 0 or num_codes <= 0:
@@ -380,7 +394,8 @@ def compute_latent_geometry_for_sample(
             ss_mean = np.zeros(ss_dim, dtype=np.float32)
 
         geo_vec = np.concatenate(
-            [center, direction, ss_mean, np.array([radius], dtype=np.float32)], axis=0
+            [center, direction, ss_mean, np.array([radius], dtype=np.float32)],
+            axis=0,
         )
         geo_per_pos[t] = geo_vec
 
@@ -411,13 +426,13 @@ def main():
     ensure_dir(out_dir)
 
     if rank == 0:
-        meta = {
+        meta: Dict[str, Any] = {
             "ckpt_path": str(ckpt_path),
             "yaml_path": str(yaml_path),
             "ckpt_sha256": sha256_of_file(str(ckpt_path)) if ckpt_path.exists() else "",
             "dtype": args.indices_dtype,
             "split": args.split,
-            "world_size": world
+            "world_size": world,
         }
         with open(out_dir / "extract_meta.json", "w") as f:
             json.dump(meta, f, indent=2)
@@ -440,8 +455,10 @@ def main():
     rank_dir = out_dir / f"rank{rank}"
     indices_dir = rank_dir / "indices_npy"
     geo_dir = rank_dir / "geo_npy"
+    ze_dir = rank_dir / "ze_npy"
     ensure_dir(indices_dir)
     ensure_dir(geo_dir)
+    ensure_dir(ze_dir)
     manifest_rank_path = out_dir / f"manifest_rank{rank}.jsonl"
 
     buffer_lines: List[str] = []
@@ -464,20 +481,26 @@ def main():
             if x is None or mask is None:
                 raise ValueError("Batch missing x or mask")
 
-            indices_bt, lengths_bt = tokenize_and_quantize(core, x, mask)  # [B,N], [B]
-            B, N = indices_bt.shape
+            indices_bt, lengths_bt, z_e_bt = tokenize_and_quantize(core, x, mask)  # [B,N_flat], [B], [B,M,D]
+            B, N_flat = indices_bt.shape
 
-            if args.expect_latent_len > 0 and N != int(args.expect_latent_len):
-                print(f"[warn][rank{rank}] latent_len mismatch: got {N}, expect {args.expect_latent_len}")
+            if args.expect_latent_len > 0 and N_flat != int(args.expect_latent_len):
+                print(f"[warn][rank{rank}] latent_len mismatch: got {N_flat}, expect {args.expect_latent_len}")
 
             x_np = x.cpu().numpy()
             mask_np = mask.cpu().numpy()
+            ze_np = z_e_bt.cpu().numpy()  # [B, M, D]
 
             for b in range(B):
                 seq = indices_bt[b].cpu().numpy()
-                latent_len = int(seq.shape[0])
+                latent_flat_len = int(seq.shape[0])
                 target_len = int(lengths_bt[b])
 
+                # encoder latents z_e for this sample
+                ze_b = ze_np[b]  # [M, D]
+                latent_tokens = int(ze_b.shape[0])
+
+                # Save indices
                 if args.indices_dtype == "int16" and int(seq.max(initial=0)) < np.iinfo(np.int16).max:
                     seq_to_save = seq.astype(np.int16, copy=False)
                     save_dtype = "int16"
@@ -489,6 +512,11 @@ def main():
                 out_path = indices_dir / f"{sid}.npy"
                 np.save(str(out_path), seq_to_save, allow_pickle=False)
 
+                # Save encoder latent z_e
+                ze_path = ze_dir / f"{sid}_ze.npy"
+                np.save(str(ze_path), ze_b.astype(np.float32, copy=False), allow_pickle=False)
+
+                # Compute geometry descriptors based on original coordinates + ss
                 x_b = x_np[b]
                 m_b = mask_np[b]
                 L = int(m_b.sum())
@@ -498,7 +526,7 @@ def main():
                     coords=coords,
                     ss=ss,
                     valid_len=L,
-                    num_codes=latent_len,
+                    num_codes=latent_flat_len,
                     num_quantizers=num_quantizers,
                 )
                 geo_path = geo_dir / f"{sid}_geo.npy"
@@ -508,7 +536,9 @@ def main():
                 rec = {
                     "id": sid,
                     "indices_path": str(out_path),
-                    "latent_len": latent_len,
+                    "latent_path": str(ze_path),
+                    "latent_len": latent_flat_len,        # flattened indices length
+                    "latent_tokens": latent_tokens,       # encoder tokens M
                     "target_len": target_len,
                     "dtype": save_dtype,
                     "rank": rank,
@@ -544,6 +574,7 @@ def main():
 
     print(f"[rank{rank}] Done. Batches: {batches_done}, samples saved: {total_saved}, manifest: {manifest_rank_path}")
     print(f"[rank{rank}] Indices dir: {indices_dir}")
+    print(f"[rank{rank}] z_e dir: {ze_dir}")
 
 
 if __name__ == "__main__":

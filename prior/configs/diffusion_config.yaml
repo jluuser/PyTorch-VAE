@@ -1,17 +1,24 @@
-# Diffusion prior configuration (x-prediction on normalized z_q)
+# Diffusion prior configuration (x-prediction on normalized latent z_e)
 
 data:
-  # JSONL manifest with indices_path, latent_len, target_len etc.
+  # JSONL manifest with indices_path, latent_path, latent_len, latent_tokens, target_len etc.
+  # This is produced by scripts/extract_code_indices.py
   train_manifest: "prior/out_prior_token64_K1024_D512_Residual_VQ_data/train/manifest.jsonl"
   val_manifest: "prior/out_prior_token64_K1024_D512_Residual_VQ_data/val/manifest.jsonl"
+
+  # Latent type for diffusion prior:
+  #   "indices" -> z_q from indices (old mode)
+  #   "ze"      -> encoder latents z_e from latent_path (recommended)
+  latent_type: "ze"
 
   # Pad token id used when extracting indices for prior training
   pad_token_id: 4096
 
-  # Maximum flattened latent length (optional). Should be multiple of num_quantizers.
+  # Maximum flattened latent length (optional). For RVQ this is N_flat = M * num_quantizers.
+  # For z_e training mode, this still controls the maximum allowed length in the manifest.
   max_len: 256
 
-  batch_size: 64
+  batch_size: 512
   num_workers: 4
   pin_memory: true
 
@@ -22,7 +29,7 @@ data:
   # Number of residual quantizers used by the VQ-VAE
   num_quantizers: 4
 
-  # Length conditioning: enable p(z_q | L)
+  # Length conditioning: enable p(z | L)
   use_length_cond: true
   # Maximum target length in the original curve space used for length normalization
   max_target_len: 350
@@ -58,8 +65,8 @@ optim:
   betas: [0.9, 0.99]
   weight_decay: 0.0
 
-  max_updates: 80000
-  warmup_updates: 2000
+  max_updates: 200000
+  warmup_updates: 5000
   grad_clip_norm: 1.0
 
 ema:
@@ -71,11 +78,38 @@ runtime:
   amp: true
   device: "cuda"
 
-  ckpt_dir: "prior/prior_ckpts/diffusion_prior_1_15"
+  ckpt_dir: "prior/prior_ckpts/diffusion_prior_1_17"
 
   log_interval: 100
   eval_interval_updates: 2000
   save_interval_updates: 10000
 
-  # Path to the z_q statistics computed by scripts/compute_zq_stats.py
-  zq_stats_path: "prior/zq_stats_token64_K1024_D512.npz"
+  # Path to the latent statistics (z_e) computed by scripts/compute_ze_stats.py
+  latent_stats_path: "prior/ze_stats_token64_K1024_D512.npz"
+
+geom:
+  # Enable geometry regularization inside the diffusion prior training
+  enable: false
+
+  # Loss weights for different geometric terms
+  lambda_collision: 0.0        # main term: penalize self-collisions
+  lambda_bond: 5.0e-5          # optional: keep bond lengths in a reasonable range
+  lambda_angle: 0.0            # optional: keep bond angles in a reasonable range
+
+  # How many sequences per batch are used for geometry loss
+  max_batch: 8
+
+  # Sampling strategy for point-to-point collision loss
+  max_token_samples: 32         # number of i-positions sampled per sequence
+  max_pairs_per_token: 4        # number of j-partners per sampled i
+  neighbor_exclude: 2           # ignore |i-j| <= neighbor_exclude in sequence
+  min_pairwise_dist: 2.0
+
+  # Target ranges for local backbone geometry
+  bond_target_min: 3.5          # desired lower bound for Cα–Cα bond length
+  bond_target_max: 4.2          # desired upper bound for Cα–Cα bond length
+  angle_min_deg: 80.0           # desired lower bound for Cα–Cα–Cα bond angle (deg)
+  angle_max_deg: 150.0          # desired upper bound for Cα–Cα–Cα bond angle (deg)
+
+  # Apply geometry loss every N optimization steps (1 = every step)
+  step_interval: 1
