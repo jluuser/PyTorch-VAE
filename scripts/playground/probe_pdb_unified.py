@@ -4,6 +4,17 @@
 """
 Probe generated curves (or PDBs) into an existing latent background (t-SNE/UMAP).
 
+3.1 先投影得到 probe cache
+
+scripts/playground/probe_pdb_unified.py
+
+
+3.2 再用 probe cache 画图
+
+scripts/playground/render_pdb_probe_overlay.py
+
+
+
 This script supports two input modes:
 
 (A) --curve_dir:

@@ -3,7 +3,7 @@ import os
 import argparse
 from Bio.PDB import PDBIO, Structure, Model, Chain, Atom, Residue
 '''
-python npy_to_pdb.py --input_dir /public/home/zhangyangroup/chengshiz/keyuan.zhou/prp-dataset/test_dataset_50/npy --output_dir /public/home/zhangyangroup/chengshiz/keyuan.zhou/prp-dataset/test_dataset_50/npy_converted_pdb
+python npy_to_pdb.py --input_dir /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/results/aeot_runs/test_run_random_02/filtered_npy --output_dir /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/results/aeot_runs/test_run_random_02/filtered_pdb
 '''    
 def write_pdb(coords: np.array, pdb_file):
     structure = Structure.Structure("example")
