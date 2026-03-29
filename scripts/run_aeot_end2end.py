@@ -13,17 +13,19 @@ Key behavior (per your requirement):
 
 Outputs:
   run_dir/
-    filtered_npy/                 # final accepted curves as npy [L,6]
+    filtered_npy/                  # final accepted curves as npy [L,6]
     filtered_manifest.jsonl        # json per line with geometry/ss stats
+    rejected_npy/                  # rejected decoded curves as npy [L,6]
+    rejected_manifest.jsonl        # json per line with reject_reason / stats
     summary.json                   # timings and rejection stats
     args.json
 
 Example:
 python scripts/run_aeot_end2end.py \
   --ae_config configs/stage1_ae.yaml \
-  --ae_ckpt /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/checkpoints/aeot_sigmoid/epochepoch=epoch=089.ckpt \
-  --features_pt /public/home/zhangyangroup/chengshiz/keyuan.zhou/AE-OT/results_curves/features_5w.pt \
-  --ot_h /public/home/zhangyangroup/chengshiz/keyuan.zhou/AE-OT/results_curves/h.pt \
+  --ae_ckpt /home/zky/PyTorch-VAE/checkpoints/aeot_sigmoid/epochepoch=epoch=089.ckpt \
+  --features_pt /home/zky/AE-OT/results_curves/features_5w.pt \
+  --ot_h /home/zky/AE-OT/results_curves/h.pt \
   --out_root results/aeot_runs \
   --run_name test_run_random_02 \
   --n_generate 5000 \
@@ -34,13 +36,15 @@ python scripts/run_aeot_end2end.py \
   --min_length 2 \
   --min_pairwise_dist 2.0 \
   --neighbor_exclude 2 \
-  --ot_root /public/home/zhangyangroup/chengshiz/keyuan.zhou/AE-OT \
+  --ot_root /home/zky/AE-OT \
+  --gpu_id 0 \
   --select_random \
   --seed 42
 """
 
 import argparse
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -127,6 +131,13 @@ def _build_mask_from_lengths(lengths: torch.Tensor, device: torch.device) -> tor
     return ar < lengths.view(-1, 1)
 
 
+def _sanitize_name_for_filename(name: str) -> str:
+    name = str(name).strip()
+    name = re.sub(r"[^A-Za-z0-9._-]+", "_", name)
+    name = name.strip("._-")
+    return name or "task"
+
+
 # ------------------------ OT sampling (from demo_curves.py logic) ------------------------ #
 
 @torch.no_grad()
@@ -139,7 +150,7 @@ def ot_generate_latents(
     thresh: float,
     latent_key: str = "latents",
     lengths_key: str = "lengths",
-    ot_device: str = "cpu",
+    ot_device: str = "cuda",
 ) -> Dict[str, torch.Tensor]:
     """
     Load training latents P from features_pt, load OT parameter h.pt, then generate new latents
@@ -493,7 +504,7 @@ def curve_pass_filter(
     coords = curve6[:, :3]
 
     # thresholds aligned with your filter script
-    BOND_MIN_ALLOWED = 2.2
+    BOND_MIN_ALLOWED = 1.4
     BOND_MAX_ALLOWED = 7.5
     BOND_GOOD_MIN = 2.0
     BOND_GOOD_MAX = 7.2
@@ -611,6 +622,8 @@ def parse_args():
                     help="PyTorch-VAE repo root (default: parent of scripts/)")
     ap.add_argument("--ot_root", type=str, default="",
                     help="Directory containing pyOMT_raw.py (if not importable by default)")
+    ap.add_argument("--gpu_id", type=int, default=0,
+                    help="Pin this process to a single CUDA device id (default: 0).")
 
     ap.add_argument("--ae_config", type=str, required=True)
     ap.add_argument("--ae_ckpt", type=str, required=True)
@@ -636,10 +649,10 @@ def parse_args():
                          "You may set this larger than n_generate to ensure enough OT candidates.")
     ap.add_argument("--ot_bat_size_n", type=int, default=10000)
     ap.add_argument("--ot_thresh", type=float, default=0.3)
-    ap.add_argument("--ot_device", type=str, default="cpu", help="cpu or cuda")
+    ap.add_argument("--ot_device", type=str, default="cuda", help="cpu / cuda / cuda:N")
 
     # Decoding
-    ap.add_argument("--decode_device", type=str, default="cuda")
+    ap.add_argument("--decode_device", type=str, default="cuda", help="cpu / cuda / cuda:N")
     ap.add_argument("--decode_batch_size", type=int, default=64)
     ap.add_argument("--latent_key", type=str, default="latents")
     ap.add_argument("--min_len_clamp", type=int, default=1)
@@ -659,7 +672,7 @@ def parse_args():
     ap.add_argument("--min_strand_len", type=int, default=3)
 
     # Output
-    ap.add_argument("--name_pattern", type=str, default="gen_{idx:06d}.npy")
+    ap.add_argument("--name_pattern", type=str, default="{run_name}_gen_{idx:06d}.npy")
     ap.add_argument("--save_raw_decoded", action="store_true",
                     help="Also save all decoded curves (raw) before filtering.")
 
@@ -668,6 +681,20 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    # Pin to a single GPU for stable API/service deployment.
+    if torch.cuda.is_available():
+        gpu_id = int(args.gpu_id)
+        if gpu_id < 0 or gpu_id >= torch.cuda.device_count():
+            raise ValueError(
+                f"--gpu_id={gpu_id} is invalid for this host (cuda device_count={torch.cuda.device_count()})."
+            )
+        torch.cuda.set_device(gpu_id)
+        if str(args.ot_device).lower() == "cuda":
+            args.ot_device = f"cuda:{gpu_id}"
+        if str(args.decode_device).lower() == "cuda":
+            args.decode_device = f"cuda:{gpu_id}"
+        print(f"[info] Single-GPU mode enabled: gpu_id={gpu_id}, ot_device={args.ot_device}, decode_device={args.decode_device}")
 
     repo_root = str(Path(args.repo_root).resolve())
     out_root = Path(args.out_root)
@@ -678,6 +705,7 @@ def main():
         run_name = time.strftime("%Y%m%d_%H%M%S")
     run_dir = out_root / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
+    file_run_name = _sanitize_name_for_filename(run_name)
 
     raw_dir = run_dir / "decoded_npy" if args.save_raw_decoded else None
     if raw_dir is not None:
@@ -685,8 +713,11 @@ def main():
 
     filtered_dir = run_dir / "filtered_npy"
     filtered_dir.mkdir(parents=True, exist_ok=True)
+    rejected_dir = run_dir / "rejected_npy"
+    rejected_dir.mkdir(parents=True, exist_ok=True)
 
     manifest_path = run_dir / "filtered_manifest.jsonl"
+    rejected_manifest_path = run_dir / "rejected_manifest.jsonl"
     summary_path = run_dir / "summary.json"
 
     # Save args
@@ -795,6 +826,7 @@ def main():
     }
 
     mf = open(manifest_path, "w", encoding="utf-8")
+    rmf = open(rejected_manifest_path, "w", encoding="utf-8")
 
     # 3) Decode + Filter (single pass, streaming)
     t_df0 = time.time()
@@ -830,7 +862,7 @@ def main():
 
             # optionally save raw decoded
             if raw_dir is not None:
-                raw_path = raw_dir / args.name_pattern.format(idx=global_idx)
+                raw_path = raw_dir / args.name_pattern.format(idx=global_idx, run_name=file_run_name)
                 np.save(str(raw_path), curve6, allow_pickle=False)
 
             passed, stats, reason = curve_pass_filter(curve6, args)
@@ -838,9 +870,25 @@ def main():
 
             if not passed:
                 reject_counts[reason] = reject_counts.get(reason, 0) + 1
+                rej_path = rejected_dir / args.name_pattern.format(idx=global_idx, run_name=file_run_name)
+                np.save(str(rej_path), curve6, allow_pickle=False)
+                rej_rec = {
+                    "i": int(global_idx),
+                    "recon_path": str(rej_path),
+                    "length_recon": int(L),
+                    "reject_reason": str(reason),
+                    "ot_thresh": float(args.ot_thresh),
+                    "num_gen_x": int(args.num_gen_x),
+                    "ot_bat_size_n": int(args.ot_bat_size_n),
+                    "ae_ckpt": str(args.ae_ckpt),
+                    "features_pt": str(args.features_pt),
+                    "ot_h": str(args.ot_h),
+                }
+                rej_rec.update(stats)
+                rmf.write(json.dumps(rej_rec) + "\n")
                 continue
 
-            out_path = filtered_dir / args.name_pattern.format(idx=global_idx)
+            out_path = filtered_dir / args.name_pattern.format(idx=global_idx, run_name=file_run_name)
             np.save(str(out_path), curve6, allow_pickle=False)
 
             rec = {
@@ -863,6 +911,7 @@ def main():
     pbar.close()
     t_df1 = time.time()
     mf.close()
+    rmf.close()
 
     t1 = time.time()
 
@@ -881,6 +930,8 @@ def main():
         "outputs": {
             "filtered_dir": str(filtered_dir),
             "filtered_manifest": str(manifest_path),
+            "rejected_dir": str(rejected_dir),
+            "rejected_manifest": str(rejected_manifest_path),
             "summary": str(summary_path),
             "raw_decoded_dir": str(raw_dir) if raw_dir is not None else "",
         },

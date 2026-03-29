@@ -10,7 +10,7 @@ from tqdm import tqdm
 Example:
 python scripts/extract_ae_latents.py \
   --config configs/stage1_ae.yaml \
-  --ckpt /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/checkpoints/aeot_sigmoid/epochepoch=epoch=089.ckpt \
+  --ckpt /home/zky/PyTorch-VAE/checkpoints/aeot_sigmoid/epochepoch=epoch=089.ckpt \
   --out data/ae_sigmoid_latents_len1_80.pt \
   --batch_size 512 \
   --device cuda \

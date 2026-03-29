@@ -57,7 +57,7 @@ model_params:
   codebook_init_path: ""
 
 data_params:
-  npy_dir: "/public/home/zhangyangroup/chengshiz/keyuan.zhou/prp-dataset/filtered_curves_npy/"
+  npy_dir: "/home/zky/prp-dataset/filtered_curves_npy/"
   train_list: "train_list.txt"
   val_list: "val_list.txt"
   train_batch_size: 128

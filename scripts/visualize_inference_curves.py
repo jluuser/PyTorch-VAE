@@ -12,9 +12,9 @@ Supported inputs per .npy:
 It draws a 3D polyline with segment colors by SS (H/E/C) and saves PNGs.
 
 Usage:
-  python /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/scripts/visualize_inference_curves.py \
-  --dir /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/results/decoded_npy_120_filtered \
-  --out_dir /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/results/decoded_npy_120_filtered/visualizations \
+  python /home/zky/PyTorch-VAE/scripts/visualize_inference_curves.py \
+  --dir /home/zky/PyTorch-VAE/results/aeot_runs/smoke_test_1/filtered_npy \
+  --out_dir /home/zky/PyTorch-VAE/results/aeot_runs/smoke_test_1/visualizations \
 
 
   --yaml /public/home/zhangyangroup/chengshiz/keyuan.zhou/PyTorch-VAE/configs/stage2_vq.yaml(optional)
