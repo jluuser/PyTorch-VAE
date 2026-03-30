@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Dict, Optional
 
 import numpy as np
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -34,6 +34,7 @@ from pydantic import BaseModel, Field
 
 REPO_ROOT = Path("/home/zky/PyTorch-VAE")
 SCRIPT_PATH = REPO_ROOT / "scripts" / "run_aeot_end2end.py"
+DOWNSTREAM_SCRIPT_PATH = REPO_ROOT / "scripts" / "run_protpainter_downstream.py"
 DEFAULT_AE_CONFIG = str(REPO_ROOT / "configs" / "stage1_ae.yaml")
 DEFAULT_AE_CKPT = "/home/zky/PyTorch-VAE/checkpoints/aeot_sigmoid/epochepoch=epoch=089.ckpt"
 DEFAULT_FEATURES_PT = "/home/zky/AE-OT/results_curves/features_5w.pt"
@@ -41,6 +42,24 @@ DEFAULT_OT_H = "/home/zky/AE-OT/results_curves/h.pt"
 DEFAULT_OT_ROOT = "/home/zky/AE-OT"
 DEFAULT_OUT_ROOT = "/data/zky/api_results"
 DEFAULT_GPU_ID = 0
+DEFAULT_DOWNSTREAM_PYTHON = os.environ.get("PROTPAINTER_PYTHON", "python")
+
+HELIX_CONSTRAINTS = {
+    "a": (89.0, 12.0),
+    "d": (50.0, 20.0),
+    "d2": (5.5, 0.5),
+    "d3": (5.3, 0.5),
+    "d4": (6.4, 0.6),
+}
+STRAND_CONSTRAINTS = {
+    "a": (124.0, 14.0),
+    "d": (-170.0, 45.0),
+    "d2": (6.7, 0.6),
+    "d3": (9.9, 0.9),
+    "d4": (12.4, 1.1),
+}
+HELIX_SIZE = 5
+STRAND_SIZE = 4
 
 
 class GenerateRequest(BaseModel):
@@ -62,9 +81,14 @@ class GenerateRequest(BaseModel):
     gpu_id: int = DEFAULT_GPU_ID
 
 
+class DownstreamSelectionRequest(BaseModel):
+    curve_names: list[str] = Field(default_factory=list, description="Filtered curve filenames selected for downstream pipeline")
+
+
 @dataclass
 class TaskState:
     task_id: str
+    gpu_id: int = DEFAULT_GPU_ID
     status: str = "queued"  # queued/running/done/failed
     created_at: float = field(default_factory=time.time)
     started_at: Optional[float] = None
@@ -73,6 +97,13 @@ class TaskState:
     summary_path: str = ""
     stdout_tail: str = ""
     error: str = ""
+    downstream_status: str = "idle"  # idle/queued/running/done/failed
+    downstream_started_at: Optional[float] = None
+    downstream_ended_at: Optional[float] = None
+    downstream_dir: str = ""
+    downstream_summary_path: str = ""
+    downstream_error: str = ""
+    downstream_stdout_tail: str = ""
 
 
 app = FastAPI(title="AEOT Single-GPU API", version="1.0.0")
@@ -81,7 +112,9 @@ if WEB_DIR.is_dir():
     app.mount("/web", StaticFiles(directory=str(WEB_DIR), html=True), name="web")
 
 task_queue: "queue.Queue[tuple[str, GenerateRequest]]" = queue.Queue()
+downstream_queue: "queue.Queue[str]" = queue.Queue()
 tasks: Dict[str, TaskState] = {}
+gpu_job_lock = threading.Lock()
 
 
 def _sanitize_run_name(name: str) -> str:
@@ -197,6 +230,172 @@ def _load_curve_payload(path: Path, rec: Optional[dict] = None) -> dict:
     }
 
 
+def _np_distance(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    return np.linalg.norm(a - b, axis=-1)
+
+
+def _np_angle(x: np.ndarray, y: np.ndarray, z: np.ndarray) -> np.ndarray:
+    v1 = x - y
+    v2 = z - y
+    denom = np.linalg.norm(v1, axis=-1) * np.linalg.norm(v2, axis=-1)
+    denom = np.maximum(denom, 1e-8)
+    cosv = np.sum(v1 * v2, axis=-1) / denom
+    cosv = np.clip(cosv, -1.0, 1.0)
+    return np.degrees(np.arccos(cosv))
+
+
+def _np_dihedral(w: np.ndarray, x: np.ndarray, y: np.ndarray, z: np.ndarray) -> np.ndarray:
+    b0 = w - x
+    b1 = y - x
+    b2 = z - y
+    b1_norm = np.linalg.norm(b1, axis=-1, keepdims=True)
+    b1 = b1 / np.maximum(b1_norm, 1e-8)
+    v = b0 - np.sum(b0 * b1, axis=-1, keepdims=True) * b1
+    wv = b2 - np.sum(b2 * b1, axis=-1, keepdims=True) * b1
+    x_ = np.sum(v * wv, axis=-1)
+    y_ = np.sum(np.cross(b1, v) * wv, axis=-1)
+    return np.degrees(np.arctan2(y_, x_))
+
+
+def _cond_to_pred_np(cond: np.ndarray, size: int) -> np.ndarray:
+    n = cond.shape[0]
+    if n <= 0:
+        return np.zeros(0, dtype=bool)
+    if n < size:
+        return np.zeros(n, dtype=bool)
+    window_ok = np.array([bool(np.all(cond[i:i + size])) for i in range(n - size + 1)], dtype=bool)
+    pred = np.zeros(n, dtype=bool)
+    for i, ok in enumerate(window_ok):
+        if ok:
+            pred[i:i + size] = True
+    return pred
+
+
+def _assign_ss_idx_from_xyz(xyz: np.ndarray) -> np.ndarray:
+    n = int(xyz.shape[0])
+    if n < 5:
+        return np.full(n, 2, dtype=np.int32)
+
+    x0 = xyz[:-4]
+    x1 = xyz[1:-3]
+    x2 = xyz[2:-2]
+    x3 = xyz[3:-1]
+    x4 = xyz[4:]
+
+    values = {
+        "a": _np_angle(x0, x1, x2),
+        "d": _np_dihedral(x0, x1, x2, x3),
+        "d2": _np_distance(x2, x0),
+        "d3": _np_distance(x3, x0),
+        "d4": _np_distance(x4, x0),
+    }
+
+    helix_cond = {}
+    for key, (center, tol) in HELIX_CONSTRAINTS.items():
+        helix_cond[key] = (values[key] >= center - tol) & (values[key] <= center + tol)
+    strand_cond = {}
+    for key, (center, tol) in STRAND_CONSTRAINTS.items():
+        strand_cond[key] = (values[key] >= center - tol) & (values[key] <= center + tol)
+
+    cond_helix = (helix_cond["d3"] & helix_cond["d4"]) | (helix_cond["a"] & helix_cond["d"])
+    cond_strand = ((strand_cond["d2"] & strand_cond["d3"] & strand_cond["d4"]) | (strand_cond["a"] & strand_cond["d"]))
+
+    is_helix_core = _cond_to_pred_np(cond_helix, HELIX_SIZE)
+    is_strand_core = _cond_to_pred_np(cond_strand, STRAND_SIZE)
+
+    is_helix = np.pad(is_helix_core, (1, 3), constant_values=False)[:n]
+    is_strand = np.pad(is_strand_core, (1, 3), constant_values=False)[:n]
+    is_strand = is_strand & (~is_helix)
+
+    ss_idx = np.full(n, 2, dtype=np.int32)
+    ss_idx[is_strand] = 1
+    ss_idx[is_helix] = 0
+    return ss_idx
+
+
+def _load_pdb_trace(path: Path) -> dict:
+    xyz = []
+    atom_names = []
+    residue_ids = []
+    with path.open("r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            if not (line.startswith("ATOM") or line.startswith("HETATM")):
+                continue
+            atom_name = line[12:16].strip()
+            if atom_name != "CA":
+                continue
+            try:
+                x = float(line[30:38].strip())
+                y = float(line[38:46].strip())
+                z = float(line[46:54].strip())
+            except ValueError:
+                continue
+            xyz.append([x, y, z])
+            atom_names.append(atom_name)
+            residue_ids.append(line[22:26].strip())
+    if not xyz:
+        raise HTTPException(status_code=500, detail=f"no CA trace found in pdb: {path.name}")
+    xyz_arr = np.asarray(xyz, dtype=np.float32)
+    ss_idx = _assign_ss_idx_from_xyz(xyz_arr)
+    return {
+        "name": path.name,
+        "length": len(xyz_arr),
+        "xyz": xyz_arr.tolist(),
+        "ss_idx": ss_idx.tolist(),
+        "atom_name": atom_names,
+        "residue_id": residue_ids,
+    }
+
+
+def _selection_dir(st: TaskState) -> Path:
+    if not st.run_dir:
+        raise HTTPException(status_code=409, detail="task output is not ready")
+    return Path(st.run_dir) / "selected_curves"
+
+
+def _selection_path(st: TaskState) -> Path:
+    return _selection_dir(st) / "selected_manifest.json"
+
+
+def _default_downstream_stages() -> list[dict]:
+    return [
+        {"key": "sketch", "label": "Sketch", "status": "planned"},
+        {"key": "backbone", "label": "Backbone", "status": "planned"},
+        {"key": "sequence", "label": "Sequence", "status": "planned"},
+        {"key": "folded", "label": "Folded", "status": "planned"},
+        {"key": "evaluation", "label": "Evaluation", "status": "planned"},
+    ]
+
+
+def _empty_downstream_selection(st: TaskState) -> dict:
+    return {
+        "task_id": st.task_id,
+        "run_dir": st.run_dir,
+        "selection_path": str(_selection_path(st)),
+        "selected_count": 0,
+        "selected_at": None,
+        "curves": [],
+        "stages": _default_downstream_stages(),
+    }
+
+
+def _load_downstream_selection(st: TaskState) -> dict:
+    manifest_path = _selection_path(st)
+    if not manifest_path.is_file():
+        return _empty_downstream_selection(st)
+    try:
+        with manifest_path.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"failed to read downstream selection: {e}")
+    payload.setdefault("task_id", st.task_id)
+    payload.setdefault("run_dir", st.run_dir)
+    payload.setdefault("selection_path", str(manifest_path))
+    payload.setdefault("selected_count", len(payload.get("curves", [])))
+    payload.setdefault("stages", _default_downstream_stages())
+    return payload
+
+
 def _build_cmd(req: GenerateRequest, task_id: str) -> list[str]:
     run_name = _effective_run_name(req, task_id)
     return [
@@ -223,6 +422,24 @@ def _build_cmd(req: GenerateRequest, task_id: str) -> list[str]:
     ]
 
 
+def _downstream_output_dir(st: TaskState) -> Path:
+    if not st.run_dir:
+        raise HTTPException(status_code=409, detail="task output is not ready")
+    return Path(st.run_dir) / "downstream"
+
+
+def _build_downstream_cmd(st: TaskState) -> list[str]:
+    selection_path = _selection_path(st)
+    return [
+        DEFAULT_DOWNSTREAM_PYTHON,
+        str(DOWNSTREAM_SCRIPT_PATH),
+        "--selection_manifest", str(selection_path),
+        "--output_root", str(_downstream_output_dir(st)),
+        "--gpu_id", str(st.gpu_id),
+        "--num_bbs", "1",
+    ]
+
+
 def _worker_loop() -> None:
     while True:
         task_id, req = task_queue.get()
@@ -235,15 +452,16 @@ def _worker_loop() -> None:
         env["CUDA_VISIBLE_DEVICES"] = str(req.gpu_id)
 
         try:
-            proc = subprocess.run(
-                cmd,
-                cwd=str(REPO_ROOT),
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                check=False,
-            )
+            with gpu_job_lock:
+                proc = subprocess.run(
+                    cmd,
+                    cwd=str(REPO_ROOT),
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    check=False,
+                )
             out = proc.stdout[-12000:] if proc.stdout else ""
             st.stdout_tail = out
 
@@ -274,8 +492,61 @@ def _worker_loop() -> None:
             task_queue.task_done()
 
 
+def _downstream_worker_loop() -> None:
+    while True:
+        task_id = downstream_queue.get()
+        st = tasks[task_id]
+        st.downstream_status = "running"
+        st.downstream_started_at = time.time()
+        st.downstream_error = ""
+
+        cmd = _build_downstream_cmd(st)
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = str(st.gpu_id)
+
+        try:
+            with gpu_job_lock:
+                proc = subprocess.run(
+                    cmd,
+                    cwd=str(REPO_ROOT),
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    check=False,
+                )
+            out = proc.stdout[-12000:] if proc.stdout else ""
+            st.downstream_stdout_tail = out
+            downstream_dir = str(_downstream_output_dir(st))
+            st.downstream_dir = downstream_dir
+            st.downstream_summary_path = str(Path(downstream_dir) / "downstream_summary.json")
+            if proc.returncode == 0:
+                st.downstream_status = "done"
+            else:
+                st.downstream_status = "failed"
+                st.downstream_error = f"downstream exited with code {proc.returncode}"
+        except Exception as e:
+            st.downstream_status = "failed"
+            st.downstream_error = str(e)
+        finally:
+            st.downstream_ended_at = time.time()
+            downstream_queue.task_done()
+
+
 _worker_thread = threading.Thread(target=_worker_loop, daemon=True)
 _worker_thread.start()
+_downstream_worker_thread = threading.Thread(target=_downstream_worker_loop, daemon=True)
+_downstream_worker_thread.start()
+
+
+@app.middleware("http")
+async def add_no_cache_headers(request: Request, call_next):
+    response = await call_next(request)
+    if request.url.path == "/" or request.url.path.startswith("/web"):
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
 
 
 @app.get("/health")
@@ -283,6 +554,7 @@ def health() -> dict:
     return {
         "ok": True,
         "queue_size": task_queue.qsize(),
+        "downstream_queue_size": downstream_queue.qsize(),
         "tasks": len(tasks),
         "single_gpu": True,
         "repo_root": str(REPO_ROOT),
@@ -308,7 +580,7 @@ def generate(req: GenerateRequest) -> dict:
         raise HTTPException(status_code=400, detail=f"ot_root not found: {req.ot_root}")
 
     task_id = uuid.uuid4().hex[:12]
-    tasks[task_id] = TaskState(task_id=task_id)
+    tasks[task_id] = TaskState(task_id=task_id, gpu_id=req.gpu_id)
     task_queue.put((task_id, req))
     effective_run_name = _effective_run_name(req, task_id)
     return {
@@ -412,3 +684,132 @@ def get_rejected_curve(task_id: str, curve_name: str) -> dict:
         raise HTTPException(status_code=404, detail="curve not found")
 
     return _load_curve_payload(path, manifest_map.get(path.name))
+
+
+@app.get("/tasks/{task_id}/downstream-selection")
+def get_downstream_selection(task_id: str) -> dict:
+    st = _get_task_or_404(task_id)
+    if st.status != "done":
+        raise HTTPException(status_code=409, detail=f"task is not done yet: {st.status}")
+    return _load_downstream_selection(st)
+
+
+@app.post("/tasks/{task_id}/downstream-selection")
+def save_downstream_selection(task_id: str, req: DownstreamSelectionRequest) -> dict:
+    st = _get_task_or_404(task_id)
+    if st.status != "done":
+        raise HTTPException(status_code=409, detail=f"task is not done yet: {st.status}")
+
+    filtered_dir = _resolve_curve_dir(st, "filtered")
+    manifest_map = _load_manifest_map(st, "filtered")
+
+    normalized_names: list[str] = []
+    seen: set[str] = set()
+    for raw_name in req.curve_names:
+        name = Path(str(raw_name)).name
+        if name in seen:
+            continue
+        curve_path = (filtered_dir / name).resolve()
+        if curve_path.parent != filtered_dir.resolve() or curve_path.suffix != ".npy" or not curve_path.is_file():
+            raise HTTPException(status_code=400, detail=f"filtered curve not found: {name}")
+        normalized_names.append(name)
+        seen.add(name)
+
+    records = []
+    for name in normalized_names:
+        rec = manifest_map.get(name)
+        curve_path = filtered_dir / name
+        curve_payload = _load_curve_payload(curve_path, rec)
+        records.append({
+            "name": name,
+            "curve_path": str(curve_path),
+            "length": curve_payload["length"],
+            "metrics": curve_payload["metrics"],
+            "downstream_status": "planned",
+        })
+
+    selection_dir = _selection_dir(st)
+    selection_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = _selection_path(st)
+    payload = {
+        "task_id": st.task_id,
+        "run_dir": st.run_dir,
+        "selection_path": str(manifest_path),
+        "selected_count": len(records),
+        "selected_at": time.time(),
+        "curves": records,
+        "stages": _default_downstream_stages(),
+    }
+    with manifest_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    return payload
+
+
+@app.get("/tasks/{task_id}/downstream")
+def get_downstream_status(task_id: str) -> dict:
+    st = _get_task_or_404(task_id)
+    payload = {
+        "task_id": st.task_id,
+        "status": st.downstream_status,
+        "started_at": st.downstream_started_at,
+        "ended_at": st.downstream_ended_at,
+        "output_dir": st.downstream_dir,
+        "summary_path": st.downstream_summary_path,
+        "error": st.downstream_error,
+    }
+    summary_path = Path(st.downstream_summary_path) if st.downstream_summary_path else None
+    if summary_path and summary_path.is_file():
+        try:
+            with summary_path.open("r", encoding="utf-8") as f:
+                payload["summary"] = json.load(f)
+        except Exception:
+            payload["summary"] = None
+    else:
+        payload["summary"] = None
+    return payload
+
+
+@app.post("/tasks/{task_id}/run-downstream")
+def run_downstream(task_id: str) -> dict:
+    st = _get_task_or_404(task_id)
+    if st.status != "done":
+        raise HTTPException(status_code=409, detail=f"curve task is not done yet: {st.status}")
+    selection = _load_downstream_selection(st)
+    if selection.get("selected_count", 0) <= 0:
+        raise HTTPException(status_code=400, detail="no selected curves found for downstream pipeline")
+    if st.downstream_status in {"queued", "running"}:
+        raise HTTPException(status_code=409, detail=f"downstream job is already {st.downstream_status}")
+
+    st.downstream_status = "queued"
+    st.downstream_started_at = None
+    st.downstream_ended_at = None
+    st.downstream_error = ""
+    st.downstream_stdout_tail = ""
+    st.downstream_dir = str(_downstream_output_dir(st))
+    st.downstream_summary_path = str(Path(st.downstream_dir) / "downstream_summary.json")
+    downstream_queue.put(task_id)
+    return {
+        "task_id": task_id,
+        "status": st.downstream_status,
+        "queue_size": downstream_queue.qsize(),
+        "selection_path": selection.get("selection_path"),
+        "selected_count": selection.get("selected_count", 0),
+        "output_dir": st.downstream_dir,
+    }
+
+
+@app.get("/tasks/{task_id}/downstream-pdb")
+def get_downstream_pdb(task_id: str, path: str) -> dict:
+    st = _get_task_or_404(task_id)
+    if st.downstream_status != "done":
+        raise HTTPException(status_code=409, detail=f"downstream task is not done yet: {st.downstream_status}")
+    if not st.downstream_dir:
+        raise HTTPException(status_code=409, detail="downstream output is not ready")
+
+    base_dir = Path(st.downstream_dir).resolve()
+    pdb_path = Path(path).resolve()
+    if pdb_path.suffix.lower() != ".pdb" or not pdb_path.is_file() or base_dir not in pdb_path.parents:
+        raise HTTPException(status_code=404, detail="downstream pdb not found")
+    payload = _load_pdb_trace(pdb_path)
+    payload["path"] = str(pdb_path)
+    return payload
