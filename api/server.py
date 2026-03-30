@@ -104,6 +104,7 @@ class TaskState:
     downstream_summary_path: str = ""
     downstream_error: str = ""
     downstream_stdout_tail: str = ""
+    downstream_action: str = "backbone"  # backbone / sequence_fold / evaluation
 
 
 app = FastAPI(title="AEOT Single-GPU API", version="1.0.0")
@@ -437,6 +438,9 @@ def _build_downstream_cmd(st: TaskState) -> list[str]:
         "--output_root", str(_downstream_output_dir(st)),
         "--gpu_id", str(st.gpu_id),
         "--num_bbs", "1",
+        "--stage", st.downstream_action,
+        "--num_seqs", "4",
+        "--lmpnn_temperature", "0.1",
     ]
 
 
@@ -750,6 +754,7 @@ def get_downstream_status(task_id: str) -> dict:
     st = _get_task_or_404(task_id)
     payload = {
         "task_id": st.task_id,
+        "action": st.downstream_action,
         "status": st.downstream_status,
         "started_at": st.downstream_started_at,
         "ended_at": st.downstream_ended_at,
@@ -780,6 +785,7 @@ def run_downstream(task_id: str) -> dict:
     if st.downstream_status in {"queued", "running"}:
         raise HTTPException(status_code=409, detail=f"downstream job is already {st.downstream_status}")
 
+    st.downstream_action = "backbone"
     st.downstream_status = "queued"
     st.downstream_started_at = None
     st.downstream_ended_at = None
@@ -790,6 +796,7 @@ def run_downstream(task_id: str) -> dict:
     downstream_queue.put(task_id)
     return {
         "task_id": task_id,
+        "action": st.downstream_action,
         "status": st.downstream_status,
         "queue_size": downstream_queue.qsize(),
         "selection_path": selection.get("selection_path"),
@@ -798,11 +805,81 @@ def run_downstream(task_id: str) -> dict:
     }
 
 
+@app.post("/tasks/{task_id}/run-sequence-fold")
+def run_sequence_fold(task_id: str) -> dict:
+    st = _get_task_or_404(task_id)
+    if st.status != "done":
+        raise HTTPException(status_code=409, detail=f"curve task is not done yet: {st.status}")
+    if st.downstream_status in {"queued", "running"}:
+        raise HTTPException(status_code=409, detail=f"downstream job is already {st.downstream_status}")
+    summary_path = Path(st.downstream_summary_path) if st.downstream_summary_path else _downstream_output_dir(st) / "downstream_summary.json"
+    if not summary_path.is_file():
+        raise HTTPException(status_code=409, detail="backbone downstream summary not found; run Sketch / Backbone first")
+    try:
+        with summary_path.open("r", encoding="utf-8") as f:
+            summary = json.load(f)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"failed to read downstream summary: {e}")
+    if not summary.get("backbones"):
+        raise HTTPException(status_code=409, detail="no backbone outputs found; run Sketch / Backbone first")
+
+    st.downstream_action = "sequence_fold"
+    st.downstream_status = "queued"
+    st.downstream_started_at = None
+    st.downstream_ended_at = None
+    st.downstream_error = ""
+    st.downstream_stdout_tail = ""
+    st.downstream_dir = str(_downstream_output_dir(st))
+    st.downstream_summary_path = str(Path(st.downstream_dir) / "downstream_summary.json")
+    downstream_queue.put(task_id)
+    return {
+        "task_id": task_id,
+        "action": st.downstream_action,
+        "status": st.downstream_status,
+        "queue_size": downstream_queue.qsize(),
+        "output_dir": st.downstream_dir,
+    }
+
+
+@app.post("/tasks/{task_id}/run-evaluation")
+def run_evaluation(task_id: str) -> dict:
+    st = _get_task_or_404(task_id)
+    if st.status != "done":
+        raise HTTPException(status_code=409, detail=f"curve task is not done yet: {st.status}")
+    if st.downstream_status in {"queued", "running"}:
+        raise HTTPException(status_code=409, detail=f"downstream job is already {st.downstream_status}")
+    summary_path = Path(st.downstream_summary_path) if st.downstream_summary_path else _downstream_output_dir(st) / "downstream_summary.json"
+    if not summary_path.is_file():
+        raise HTTPException(status_code=409, detail="downstream summary not found; run previous stages first")
+    try:
+        with summary_path.open("r", encoding="utf-8") as f:
+            summary = json.load(f)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"failed to read downstream summary: {e}")
+    if not summary.get("sequence_outputs"):
+        raise HTTPException(status_code=409, detail="no sequence/folded outputs found; run Sequence / Folded first")
+
+    st.downstream_action = "evaluation"
+    st.downstream_status = "queued"
+    st.downstream_started_at = None
+    st.downstream_ended_at = None
+    st.downstream_error = ""
+    st.downstream_stdout_tail = ""
+    st.downstream_dir = str(_downstream_output_dir(st))
+    st.downstream_summary_path = str(Path(st.downstream_dir) / "downstream_summary.json")
+    downstream_queue.put(task_id)
+    return {
+        "task_id": task_id,
+        "action": st.downstream_action,
+        "status": st.downstream_status,
+        "queue_size": downstream_queue.qsize(),
+        "output_dir": st.downstream_dir,
+    }
+
+
 @app.get("/tasks/{task_id}/downstream-pdb")
 def get_downstream_pdb(task_id: str, path: str) -> dict:
     st = _get_task_or_404(task_id)
-    if st.downstream_status != "done":
-        raise HTTPException(status_code=409, detail=f"downstream task is not done yet: {st.downstream_status}")
     if not st.downstream_dir:
         raise HTTPException(status_code=409, detail="downstream output is not ready")
 

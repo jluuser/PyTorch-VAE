@@ -184,14 +184,24 @@
       align-items: baseline;
       margin-bottom: 10px;
       flex-wrap: wrap;
+      min-width: 0;
+    }
+    .viewer-header > div {
+      min-width: 0;
+      flex: 1 1 auto;
     }
     .viewer-title {
       font-weight: 700;
       font-size: 16px;
+      overflow-wrap: anywhere;
+      word-break: break-word;
     }
     .viewer-sub {
       color: var(--muted);
       font-size: 12px;
+      line-height: 1.45;
+      overflow-wrap: anywhere;
+      word-break: break-word;
     }
     canvas {
       width: 100%;
@@ -385,32 +395,39 @@
     }
     .downstream-shell {
       display: grid;
-      grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
+      grid-template-columns: minmax(0, 1fr);
       gap: 16px;
     }
     .selection-list {
       display: grid;
       gap: 10px;
+      min-width: 0;
     }
     .selection-item {
       border: 1px solid var(--line);
       border-radius: 12px;
       padding: 10px 12px;
       background: rgba(255,255,255,0.92);
+      min-width: 0;
+      overflow: hidden;
     }
     .selection-name {
       font-size: 14px;
       font-weight: 700;
       margin-bottom: 4px;
+      overflow-wrap: anywhere;
+      word-break: break-word;
     }
     .selection-meta {
       font-size: 12px;
       color: var(--muted);
       line-height: 1.45;
+      overflow-wrap: anywhere;
+      word-break: break-word;
     }
     .downstream-grid {
       display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
+      grid-template-columns: repeat(3, minmax(0, 1fr));
       gap: 10px;
     }
     .downstream-viewer-shell {
@@ -418,10 +435,12 @@
       grid-template-columns: minmax(320px, 1fr) minmax(0, 1.2fr);
       gap: 16px;
       margin-top: 14px;
+      align-items: start;
     }
     .pdb-list {
       display: grid;
       gap: 10px;
+      min-width: 0;
     }
     .pdb-item {
       border: 1px solid var(--line);
@@ -430,6 +449,8 @@
       background: rgba(255,255,255,0.92);
       cursor: pointer;
       transition: border-color 0.16s ease, box-shadow 0.16s ease, transform 0.16s ease;
+      min-width: 0;
+      overflow: hidden;
     }
     .pdb-item:hover {
       transform: translateY(-1px);
@@ -466,6 +487,8 @@
       border-radius: 14px;
       padding: 12px;
       background: rgba(255,255,255,0.92);
+      min-width: 0;
+      overflow: hidden;
     }
     .downstream-title {
       font-size: 14px;
@@ -486,12 +509,32 @@
       font-size: 12px;
       line-height: 1.5;
       color: var(--muted);
+      overflow-wrap: anywhere;
+      word-break: break-word;
+    }
+    .selection-item pre {
+      max-height: 220px;
+      overflow: auto;
+      margin-top: 10px;
+    }
+    #downstreamOutputList,
+    #sequenceOutputList,
+    #evaluationOutputList {
+      max-height: 420px;
+      overflow: auto;
+      padding-right: 4px;
+    }
+    #downstreamOutputList:empty,
+    #sequenceOutputList:empty,
+    #evaluationOutputList:empty {
+      max-height: none;
     }
     @media (max-width: 1120px) {
       .layout { grid-template-columns: 1fr; }
       .summary-shell { grid-template-columns: 1fr; }
       .downstream-shell { grid-template-columns: 1fr; }
       .downstream-viewer-shell { grid-template-columns: 1fr; }
+      .downstream-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .stage-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     }
     @media (max-width: 760px) {
@@ -535,12 +578,12 @@
       <div class="stage-card pending" data-stage="folded">
         <div class="stage-kicker">Stage 5</div>
         <div class="stage-name">Folded</div>
-        <div class="stage-desc">用 OmegaFold 等模型把设计序列折回三维结构，形成回折结果。</div>
+        <div class="stage-desc">用 OmegaFold 等模型把设计序列折回三维结构，并为后续一致性指标提供输入。</div>
       </div>
       <div class="stage-card pending" data-stage="evaluation">
         <div class="stage-kicker">Stage 6</div>
         <div class="stage-name">Evaluation</div>
-        <div class="stage-desc">比较 curve / sketch / folded structure，做 RMSD、TM、pLDDT 等评估与选优。</div>
+        <div class="stage-desc">Sequence / Folded 完成后自动比较 curve / sketch / folded structure，做 RMSD、TM、pLDDT 等评估与选优。</div>
       </div>
     </div>
   </div>
@@ -660,6 +703,7 @@
             <div class="row" style="margin-top: 0; margin-bottom: 12px;">
               <button id="pushDownstreamBtn" class="secondary">准备进入下游流程</button>
               <button id="runDownstreamBtn">运行 Sketch / Backbone</button>
+              <button id="runSequenceFoldBtn">运行 Sequence / Folded</button>
               <button id="clearSelectionBtn" class="secondary">清空已选曲线</button>
             </div>
             <div class="hint" id="selectionHint" style="margin-bottom: 12px;">当前这部分先把选中的 curve 固化成任务级清单，保存到本次任务目录里，作为后续 `Sketch -> Backbone -> Sequence -> Folded -> Evaluation` 的标准入口。</div>
@@ -687,6 +731,29 @@
                   <div class="viewer-help">拖拽可以旋转，滚轮可以缩放，双击恢复默认视角。</div>
                 </div>
               </div>
+              <div class="viewer-stage" style="margin-top: 14px;">
+                <div class="viewer-header">
+                  <div>
+                    <div class="viewer-title" id="compareViewerTitle">Backbone / Folded 对比</div>
+                    <div class="viewer-sub" id="compareViewerMeta">选择 folded 结果后，这里会叠加显示 backbone 和 folded，方便直接比较。</div>
+                  </div>
+                </div>
+                <canvas id="compareCanvas" width="760" height="420"></canvas>
+                <div class="legend">
+                  <span><i class="swatch" style="background: #f97316;"></i>Backbone</span>
+                  <span><i class="swatch" style="background: #0f766e;"></i>Folded</span>
+                </div>
+              </div>
+              <div class="card" style="padding: 12px; margin-top: 12px;">
+                <h2 style="margin-bottom: 8px;">Sequence 输出</h2>
+                <div id="sequenceOutputList" class="selection-list"></div>
+                <div id="sequenceOutputEmpty" class="empty" style="padding: 16px; margin-top: 12px;">运行 Sequence / Folded 后，这里会显示每个 backbone 对应的 FASTA 和序列列表。</div>
+              </div>
+              <div class="card" style="padding: 12px; margin-top: 12px;">
+                <h2 style="margin-bottom: 8px;">Evaluation 输出</h2>
+                <div id="evaluationOutputList" class="selection-list"></div>
+                <div id="evaluationOutputEmpty" class="empty" style="padding: 16px; margin-top: 12px;">Sequence / Folded 完成后，这里会自动显示 RMSD、TM、pLDDT、curve similarity、ssAcc 等指标。</div>
+              </div>
             </div>
           </div>
           <div class="downstream-grid" id="downstreamGrid">
@@ -708,12 +775,12 @@
             <div class="downstream-card">
               <div class="downstream-title">Folded Stage</div>
               <div class="downstream-state" id="stageStateFolded">Planned</div>
-              <div class="downstream-copy">设计出的序列会再进入 OmegaFold，回折成三维结构，形成闭环验证输入。</div>
+      <div class="downstream-copy">设计出的序列会再进入 OmegaFold，回折成三维结构，并自动附带闭环验证指标。</div>
             </div>
             <div class="downstream-card">
               <div class="downstream-title">Evaluation Stage</div>
               <div class="downstream-state" id="stageStateEvaluation">Planned</div>
-              <div class="downstream-copy">最终会综合 RMSD、TM、pLDDT、curve similarity、ssACC 等指标做多指标筛选。</div>
+      <div class="downstream-copy">Folded 完成后会自动计算 RMSD、TM、pLDDT、curve similarity、ssACC 等指标，不再单独触发一步。</div>
             </div>
             <div class="downstream-card">
               <div class="downstream-title">Current Scope</div>
@@ -743,8 +810,14 @@
   const downstreamOutputEmpty = document.getElementById('downstreamOutputEmpty');
   const downstreamPdbList = document.getElementById('downstreamPdbList');
   const downstreamPdbEmpty = document.getElementById('downstreamPdbEmpty');
+  const sequenceOutputList = document.getElementById('sequenceOutputList');
+  const sequenceOutputEmpty = document.getElementById('sequenceOutputEmpty');
+  const evaluationOutputList = document.getElementById('evaluationOutputList');
+  const evaluationOutputEmpty = document.getElementById('evaluationOutputEmpty');
   const downstreamViewerTitle = document.getElementById('downstreamViewerTitle');
   const downstreamViewerMeta = document.getElementById('downstreamViewerMeta');
+  const compareViewerTitle = document.getElementById('compareViewerTitle');
+  const compareViewerMeta = document.getElementById('compareViewerMeta');
   const stageStateSketch = document.getElementById('stageStateSketch');
   const stageStateBackbone = document.getElementById('stageStateBackbone');
   const stageStateSequence = document.getElementById('stageStateSequence');
@@ -766,6 +839,7 @@
 
   const mainCanvas = document.getElementById('mainCanvas');
   const downstreamCanvas = document.getElementById('downstreamCanvas');
+  const compareCanvas = document.getElementById('compareCanvas');
 
   let currentTaskId = '';
   let currentCurves = [];
@@ -786,6 +860,9 @@
   let downstreamPdbItems = [];
   let selectedDownstreamPdbPath = '';
   let downstreamPdbCache = new Map();
+  let compareRotationMatrix = null;
+  let compareZoom = 1.0;
+  let compareDragState = null;
 
   function setSelectionHint(message) {
     selectionHint.textContent = message;
@@ -809,7 +886,8 @@
     downstreamOutputList.innerHTML = '';
     const backbones = summary?.backbones || [];
     const sketches = summary?.sketches || [];
-    if (!backbones.length && !sketches.length) {
+    const sequenceOutputs = summary?.sequence_outputs || [];
+    if (!backbones.length && !sketches.length && !sequenceOutputs.length) {
       downstreamOutputEmpty.style.display = 'block';
       return;
     }
@@ -824,8 +902,52 @@
       const box = document.createElement('div');
       box.className = 'selection-item';
       const sampleText = (item.sample_pdbs || []).length ? item.sample_pdbs.join('<br>') : '尚无 sample.pdb';
-      box.innerHTML = `<div class="selection-name">${item.name}</div><div class="selection-meta">Sketch PDB: ${item.sketch_pdb}<br>Backbone: ${sampleText}</div>`;
+      const fastaText = item.fasta_path ? `<br>Sequence FASTA: ${item.fasta_path}` : '';
+      const foldedText = (item.folded_pdbs || []).length ? `<br>Folded: ${(item.folded_pdbs || []).join('<br>')}` : '';
+      box.innerHTML = `<div class="selection-name">${item.name}</div><div class="selection-meta">Sketch PDB: ${item.sketch_pdb}<br>Backbone: ${sampleText}${fastaText}${foldedText}</div>`;
       downstreamOutputList.appendChild(box);
+    }
+  }
+
+  function renderSequenceOutputs(summary) {
+    sequenceOutputList.innerHTML = '';
+    const outputs = summary?.sequence_outputs || [];
+    if (!outputs.length) {
+      sequenceOutputEmpty.style.display = 'block';
+      return;
+    }
+    sequenceOutputEmpty.style.display = 'none';
+    for (const item of outputs) {
+      const box = document.createElement('div');
+      box.className = 'selection-item';
+      const seqLines = (item.sequences || []).map(entry => `${entry.header}\n${entry.sequence}`).join('\n\n');
+      box.innerHTML = `<div class="selection-name">${item.name}</div><div class="selection-meta">FASTA: ${item.fasta_path || '-'}<br>Sequence 数量: ${item.sequence_count ?? 0}<br>Folded PDB 数量: ${(item.folded_pdbs || []).length}</div>`;
+      if (seqLines) {
+        const pre = document.createElement('pre');
+        pre.style.marginTop = '10px';
+        pre.textContent = seqLines;
+        box.appendChild(pre);
+      }
+      sequenceOutputList.appendChild(box);
+    }
+  }
+
+  function renderEvaluationOutputs(summary) {
+    evaluationOutputList.innerHTML = '';
+    const outputs = summary?.evaluation_outputs || [];
+    if (!outputs.length) {
+      evaluationOutputEmpty.style.display = 'block';
+      return;
+    }
+    evaluationOutputEmpty.style.display = 'none';
+    for (const item of outputs) {
+      for (const row of (item.folded_results || [])) {
+        const box = document.createElement('div');
+        box.className = 'selection-item';
+        box.innerHTML = `<div class="selection-name">${item.name} / ${row.folded_pdb.split('/').slice(-1)[0]}</div>
+          <div class="selection-meta">Backbone RMSD ${formatNumber(row.rmsd_backbone)} | Backbone TM ${formatNumber(row.tm_backbone)} | Curve RMSD ${formatNumber(row.rmsd_curve)} | Curve TM ${formatNumber(row.tm_curve)} | pLDDT ${formatNumber(row.plddt)} | CurveSim ${formatNumber(row.curve_similarity, 4)} | ssAcc ${formatNumber(row.ss_acc, 4)}</div>`;
+        evaluationOutputList.appendChild(box);
+      }
     }
   }
 
@@ -856,6 +978,14 @@
     Array.from(downstreamPdbList.children).forEach(card => {
       card.classList.toggle('active', card.dataset.path === path);
     });
+    const activeItem = downstreamPdbItems.find(item => item.path === path);
+    if (activeItem?.kind === 'Folded PDB' && activeItem.comparePath) {
+      await renderCompareOverlay(activeItem.comparePath, activeItem.path, `${activeItem.name} | Backbone vs Folded`);
+    } else {
+      drawCurve(compareCanvas, null, false, true);
+      compareViewerTitle.textContent = 'Backbone / Folded 对比';
+      compareViewerMeta.textContent = '选择 folded 结果后，这里会叠加显示 backbone 和 folded，方便直接比较。';
+    }
   }
 
   function renderDownstreamPdbItems(summary) {
@@ -868,6 +998,7 @@
           path: item.sketch_pdb,
           kind: 'Sketch PDB',
           name: item.name,
+          comparePath: item.sample_pdbs?.[0] || '',
         });
       }
       for (const samplePath of (item.sample_pdbs || [])) {
@@ -875,6 +1006,15 @@
           path: samplePath,
           kind: 'Backbone PDB',
           name: item.name,
+          comparePath: '',
+        });
+      }
+      for (const foldedPath of (item.folded_pdbs || [])) {
+        downstreamPdbItems.push({
+          path: foldedPath,
+          kind: 'Folded PDB',
+          name: item.name,
+          comparePath: item.sample_pdbs?.[0] || '',
         });
       }
     }
@@ -884,6 +1024,9 @@
       downstreamViewerTitle.textContent = '尚未选择下游结构';
       downstreamViewerMeta.textContent = '运行下游后，这里会显示 Sketch PDB 或 Backbone PDB 的 3D 预览。';
       drawCurve(downstreamCanvas, null, false, true);
+      drawCurve(compareCanvas, null, false, true);
+      compareViewerTitle.textContent = 'Backbone / Folded 对比';
+      compareViewerMeta.textContent = '选择 folded 结果后，这里会叠加显示 backbone 和 folded，方便直接比较。';
       return;
     }
 
@@ -904,49 +1047,111 @@
       downstreamPdbList.appendChild(card);
     }
 
-    const defaultPath = downstreamPdbItems.find(item => item.kind === 'Backbone PDB')?.path || downstreamPdbItems[0].path;
+    const defaultPath = downstreamPdbItems.find(item => item.kind === 'Folded PDB')?.path
+      || downstreamPdbItems.find(item => item.kind === 'Backbone PDB')?.path
+      || downstreamPdbItems[0].path;
     selectDownstreamPdb(defaultPath).catch((e) => {
       downstreamViewerTitle.textContent = 'PDB 加载失败';
       downstreamViewerMeta.textContent = String(e);
     });
   }
 
+  async function renderCompareOverlay(backbonePath, foldedPath, label) {
+    if (!backbonePath || !foldedPath) {
+      drawCurve(compareCanvas, null, false, true);
+      compareViewerTitle.textContent = 'Backbone / Folded 对比';
+      compareViewerMeta.textContent = '选择 folded 结果后，这里会叠加显示 backbone 和 folded，方便直接比较。';
+      return;
+    }
+    const [backbone, folded] = await Promise.all([loadDownstreamPdb(backbonePath), loadDownstreamPdb(foldedPath)]);
+    const ctx = compareCanvas.getContext('2d');
+    const width = compareCanvas.width;
+    const height = compareCanvas.height;
+    ctx.clearRect(0, 0, width, height);
+    const grd = ctx.createLinearGradient(0, 0, 0, height);
+    grd.addColorStop(0, '#fbfefd');
+    grd.addColorStop(1, '#edf3f5');
+    ctx.fillStyle = grd;
+    ctx.fillRect(0, 0, width, height);
+    const activeRotation = compareRotationMatrix || buildDefaultRotationMatrix();
+    const activeZoom = compareZoom;
+    const combined = [...backbone.xyz, ...folded.xyz];
+    const projected = project3DWithState(combined, width, height, activeRotation, activeZoom);
+    const backbonePts = projected.slice(0, backbone.xyz.length);
+    const foldedPts = projected.slice(backbone.xyz.length);
+    const drawTrace = (pts, color) => {
+      ctx.lineWidth = 3;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      for (let i = 0; i < pts.length - 1; i++) {
+        const p1 = pts[i];
+        const p2 = pts[i + 1];
+        ctx.strokeStyle = color;
+        ctx.beginPath();
+        ctx.moveTo(p1.x, p1.y);
+        ctx.lineTo(p2.x, p2.y);
+        ctx.stroke();
+      }
+    };
+    drawTrace(backbonePts, '#f97316');
+    drawTrace(foldedPts, '#0f766e');
+    compareViewerTitle.textContent = label || 'Backbone / Folded 对比';
+    compareViewerMeta.textContent = `${PathSafe(backbonePath)} vs ${PathSafe(foldedPath)}`;
+  }
+
   function renderDownstreamStatus(data) {
     const summary = data?.summary || null;
     const stages = summary?.stages || {};
-    setDownstreamState(stageStateSketch, stages.sketch?.status === 'done' ? 'Done' : data?.status === 'running' || data?.status === 'queued' ? 'Queued/Running' : 'Planned');
-    setDownstreamState(stageStateBackbone, stages.backbone?.status === 'done' ? 'Done' : data?.status === 'running' || data?.status === 'queued' ? 'Queued/Running' : 'Planned');
-    setDownstreamState(stageStateSequence, stages.sequence?.status === 'planned' ? 'Planned' : 'Planned');
-    setDownstreamState(stageStateFolded, stages.folded?.status === 'planned' ? 'Planned' : 'Planned');
-    setDownstreamState(stageStateEvaluation, stages.evaluation?.status === 'planned' ? 'Planned' : 'Planned');
+    const phase = data?.action || 'backbone';
+    const running = data?.status === 'running' || data?.status === 'queued';
+    const phaseLabel = phase === 'sequence_fold' ? 'Sequence / Folded' : phase === 'evaluation' ? 'Evaluation' : 'Sketch / Backbone';
+    setDownstreamState(stageStateSketch, stages.sketch?.status === 'done' ? 'Done' : (running && phase === 'backbone') ? 'Queued/Running' : 'Planned');
+    setDownstreamState(stageStateBackbone, stages.backbone?.status === 'done' ? 'Done' : (running && phase === 'backbone') ? 'Queued/Running' : 'Planned');
+    setDownstreamState(stageStateSequence, stages.sequence?.status === 'done' ? 'Done' : (running && phase === 'sequence_fold') ? 'Queued/Running' : 'Planned');
+    setDownstreamState(stageStateFolded, stages.folded?.status === 'done' ? 'Done' : (running && phase === 'sequence_fold') ? 'Queued/Running' : 'Planned');
+    setDownstreamState(stageStateEvaluation, stages.evaluation?.status === 'done' ? 'Done' : (running && phase === 'evaluation') ? 'Queued/Running' : 'Planned');
 
     if (!data || data.status === 'idle') {
       downstreamMeta.textContent = '尚未启动下游流程';
       renderDownstreamOutputs(null);
       renderDownstreamPdbItems(null);
+      renderSequenceOutputs(null);
+      renderEvaluationOutputs(null);
       return;
     }
     if (data.status === 'queued') {
-      downstreamMeta.textContent = `下游任务已入队，输出目录将写入 ${data.output_dir || '-'}`;
+      downstreamMeta.textContent = `下游任务已入队（${phaseLabel}），输出目录将写入 ${data.output_dir || '-'}`;
       renderDownstreamOutputs(summary);
       renderDownstreamPdbItems(summary);
+      renderSequenceOutputs(summary);
+      renderEvaluationOutputs(summary);
       return;
     }
     if (data.status === 'running') {
-      downstreamMeta.textContent = `正在运行 Sketch / Backbone，输出目录 ${data.output_dir || '-'}`;
+      downstreamMeta.textContent = `正在运行 ${phaseLabel}，输出目录 ${data.output_dir || '-'}`;
       renderDownstreamOutputs(summary);
       renderDownstreamPdbItems(summary);
+      renderSequenceOutputs(summary);
+      renderEvaluationOutputs(summary);
       return;
     }
     if (data.status === 'failed') {
       downstreamMeta.textContent = `下游流程失败：${data.error || '未知错误'}`;
       renderDownstreamOutputs(summary);
       renderDownstreamPdbItems(summary);
+      renderSequenceOutputs(summary);
+      renderEvaluationOutputs(summary);
       return;
     }
     downstreamMeta.textContent = `下游流程完成，结果位于 ${data.output_dir || '-'}`;
     renderDownstreamOutputs(summary);
     renderDownstreamPdbItems(summary);
+    renderSequenceOutputs(summary);
+    renderEvaluationOutputs(summary);
+  }
+
+  function PathSafe(path) {
+    return (path || '').split('/').slice(-2).join('/');
   }
 
   function payload() {
@@ -1665,6 +1870,61 @@
     }
   }, { passive: false });
 
+  compareCanvas.addEventListener('pointerdown', (event) => {
+    compareDragState = {
+      startVec: canvasPointToArcballVec(compareCanvas, event.clientX, event.clientY),
+      startMatrix: compareRotationMatrix || buildDefaultRotationMatrix(),
+    };
+    compareCanvas.setPointerCapture(event.pointerId);
+  });
+
+  compareCanvas.addEventListener('pointermove', (event) => {
+    if (!compareDragState || !selectedDownstreamPdbPath) return;
+    const activeItem = downstreamPdbItems.find(item => item.path === selectedDownstreamPdbPath);
+    if (!activeItem?.comparePath || activeItem.kind !== 'Folded PDB') return;
+    const curVec = canvasPointToArcballVec(compareCanvas, event.clientX, event.clientY);
+    const axis = cross3(compareDragState.startVec, curVec);
+    const axisNorm = norm3(axis);
+    if (axisNorm < 1e-7) {
+      compareRotationMatrix = compareDragState.startMatrix;
+    } else {
+      const cosTheta = Math.max(-1, Math.min(1, dot3(compareDragState.startVec, curVec)));
+      const angle = Math.acos(cosTheta);
+      const delta = axisAngleToMat(axis, angle);
+      compareRotationMatrix = matMul3(delta, compareDragState.startMatrix);
+    }
+    renderCompareOverlay(activeItem.comparePath, activeItem.path, `${activeItem.name} | Backbone vs Folded`).catch(() => {});
+  });
+
+  function stopCompareDrag(event) {
+    if (!compareDragState) return;
+    compareDragState = null;
+    try { compareCanvas.releasePointerCapture(event.pointerId); } catch (_) {}
+  }
+
+  compareCanvas.addEventListener('pointerup', stopCompareDrag);
+  compareCanvas.addEventListener('pointerleave', stopCompareDrag);
+  compareCanvas.addEventListener('dblclick', () => {
+    compareRotationMatrix = buildDefaultRotationMatrix();
+    compareZoom = 1.0;
+    const activeItem = downstreamPdbItems.find(item => item.path === selectedDownstreamPdbPath);
+    if (activeItem?.comparePath && activeItem.kind === 'Folded PDB') {
+      renderCompareOverlay(activeItem.comparePath, activeItem.path, `${activeItem.name} | Backbone vs Folded`).catch(() => {});
+    }
+  });
+
+  compareCanvas.addEventListener('wheel', (event) => {
+    event.preventDefault();
+    const factor = event.deltaY < 0 ? 1.08 : 1 / 1.08;
+    compareZoom = Math.max(0.45, Math.min(4.0, compareZoom * factor));
+    const activeItem = downstreamPdbItems.find(item => item.path === selectedDownstreamPdbPath);
+    if (activeItem?.comparePath && activeItem.kind === 'Folded PDB') {
+      renderCompareOverlay(activeItem.comparePath, activeItem.path, `${activeItem.name} | Backbone vs Folded`).catch(() => {});
+    } else {
+      drawCurve(compareCanvas, null, false, true);
+    }
+  }, { passive: false });
+
   document.getElementById('startBtn').addEventListener('click', startTask);
   document.getElementById('queryBtn').addEventListener('click', queryTask);
   document.getElementById('clearSelectionBtn').addEventListener('click', async () => {
@@ -1702,12 +1962,29 @@
       window.alert(`启动下游流程失败:\n${e}`);
     }
   });
+  document.getElementById('runSequenceFoldBtn').addEventListener('click', async () => {
+    if (!currentTaskId) {
+      window.alert('请先完成一个 curve 任务，并先跑通 Sketch / Backbone。');
+      return;
+    }
+    try {
+      const res = await fetch(`/tasks/${currentTaskId}/run-sequence-fold`, { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(JSON.stringify(data));
+      downstreamMeta.textContent = `Sequence / Folded 已提交，当前队列长度 ${data.queue_size ?? '-'}，输出目录 ${data.output_dir || '-'}`;
+      pollDownstream();
+    } catch (e) {
+      window.alert(`启动 Sequence / Folded 失败:\n${e}`);
+    }
+  });
   rotationMatrix = buildDefaultRotationMatrix();
   downstreamRotationMatrix = buildDefaultRotationMatrix();
+  compareRotationMatrix = buildDefaultRotationMatrix();
   renderSelectedCurves();
   renderDownstreamStatus({ status: 'idle' });
   drawCurve(mainCanvas, null, false);
   drawCurve(downstreamCanvas, null, false, true);
+  drawCurve(compareCanvas, null, false, true);
 </script>
 </body>
 </html>
