@@ -27,7 +27,7 @@ from typing import Dict, Optional
 
 import numpy as np
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import RedirectResponse
+from fastapi.responses import PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -346,6 +346,68 @@ def _load_pdb_trace(path: Path) -> dict:
         "atom_name": atom_names,
         "residue_id": residue_ids,
     }
+
+
+def _kabsch_align(ref_xyz: np.ndarray, mobile_xyz: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    n = min(len(ref_xyz), len(mobile_xyz))
+    if n <= 0:
+        raise HTTPException(status_code=400, detail="no overlapping trace points for alignment")
+    ref = np.asarray(ref_xyz[:n], dtype=np.float64)
+    mob = np.asarray(mobile_xyz[:n], dtype=np.float64)
+    ref_centroid = ref.mean(axis=0)
+    mob_centroid = mob.mean(axis=0)
+    ref_c = ref - ref_centroid
+    mob_c = mob - mob_centroid
+    h = mob_c.T @ ref_c
+    u, _, vt = np.linalg.svd(h)
+    r = vt.T @ u.T
+    if np.linalg.det(r) < 0:
+        vt[-1, :] *= -1.0
+        r = vt.T @ u.T
+    mob_aligned = (mob_c @ r.T) + ref_centroid
+    return ref.astype(np.float32), mob_aligned.astype(np.float32)
+
+
+def _kabsch_transform(ref_xyz: np.ndarray, mobile_xyz: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+    n = min(len(ref_xyz), len(mobile_xyz))
+    if n <= 0:
+        raise HTTPException(status_code=400, detail="no overlapping trace points for alignment")
+    ref = np.asarray(ref_xyz[:n], dtype=np.float64)
+    mob = np.asarray(mobile_xyz[:n], dtype=np.float64)
+    ref_centroid = ref.mean(axis=0)
+    mob_centroid = mob.mean(axis=0)
+    ref_c = ref - ref_centroid
+    mob_c = mob - mob_centroid
+    h = mob_c.T @ ref_c
+    u, _, vt = np.linalg.svd(h)
+    r = vt.T @ u.T
+    if np.linalg.det(r) < 0:
+        vt[-1, :] *= -1.0
+        r = vt.T @ u.T
+    return ref_centroid.astype(np.float64), mob_centroid.astype(np.float64), r.astype(np.float64), n
+
+
+def _transform_pdb_text(path: Path, ref_centroid: np.ndarray, mobile_centroid: np.ndarray, rotation: np.ndarray) -> str:
+    out_lines = []
+    with path.open("r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            if line.startswith(("ATOM", "HETATM")):
+                try:
+                    x = float(line[30:38].strip())
+                    y = float(line[38:46].strip())
+                    z = float(line[46:54].strip())
+                except ValueError:
+                    out_lines.append(line)
+                    continue
+                xyz = np.asarray([x, y, z], dtype=np.float64)
+                new_xyz = ((xyz - mobile_centroid) @ rotation.T) + ref_centroid
+                line = (
+                    f"{line[:30]}"
+                    f"{new_xyz[0]:8.3f}{new_xyz[1]:8.3f}{new_xyz[2]:8.3f}"
+                    f"{line[54:]}"
+                )
+            out_lines.append(line)
+    return "".join(out_lines)
 
 
 def _selection_dir(st: TaskState) -> Path:
@@ -890,3 +952,89 @@ def get_downstream_pdb(task_id: str, path: str) -> dict:
     payload = _load_pdb_trace(pdb_path)
     payload["path"] = str(pdb_path)
     return payload
+
+
+@app.get("/tasks/{task_id}/downstream-pdb-text")
+def get_downstream_pdb_text(task_id: str, path: str) -> PlainTextResponse:
+    st = _get_task_or_404(task_id)
+    if not st.downstream_dir:
+        raise HTTPException(status_code=409, detail="downstream output is not ready")
+
+    base_dir = Path(st.downstream_dir).resolve()
+    pdb_path = Path(path).resolve()
+    if pdb_path.suffix.lower() != ".pdb" or not pdb_path.is_file() or base_dir not in pdb_path.parents:
+        raise HTTPException(status_code=404, detail="downstream pdb not found")
+    try:
+        text = pdb_path.read_text(encoding="utf-8", errors="ignore")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"failed to read pdb: {e}")
+    return PlainTextResponse(text)
+
+
+@app.get("/tasks/{task_id}/downstream-compare")
+def get_downstream_compare(task_id: str, ref: str, mobile: str) -> dict:
+    st = _get_task_or_404(task_id)
+    if not st.downstream_dir:
+        raise HTTPException(status_code=409, detail="downstream output is not ready")
+
+    base_dir = Path(st.downstream_dir).resolve()
+    ref_path = Path(ref).resolve()
+    mobile_path = Path(mobile).resolve()
+    for path in (ref_path, mobile_path):
+        if path.suffix.lower() != ".pdb" or not path.is_file() or base_dir not in path.parents:
+            raise HTTPException(status_code=404, detail=f"compare pdb not found: {path}")
+
+    ref_payload = _load_pdb_trace(ref_path)
+    mobile_payload = _load_pdb_trace(mobile_path)
+    ref_xyz, mobile_xyz = _kabsch_align(
+        np.asarray(ref_payload["xyz"], dtype=np.float32),
+        np.asarray(mobile_payload["xyz"], dtype=np.float32),
+    )
+    n = min(len(ref_xyz), len(mobile_xyz), len(ref_payload["ss_idx"]), len(mobile_payload["ss_idx"]))
+    return {
+        "ref_path": str(ref_path),
+        "mobile_path": str(mobile_path),
+        "ref_name": ref_path.name,
+        "mobile_name": mobile_path.name,
+        "length": int(n),
+        "ref_xyz": ref_xyz[:n].tolist(),
+        "mobile_xyz": mobile_xyz[:n].tolist(),
+        "ref_ss_idx": ref_payload["ss_idx"][:n],
+        "mobile_ss_idx": mobile_payload["ss_idx"][:n],
+    }
+
+
+@app.get("/tasks/{task_id}/downstream-compare-pdb-text")
+def get_downstream_compare_pdb_text(task_id: str, ref: str, mobile: str) -> dict:
+    st = _get_task_or_404(task_id)
+    if not st.downstream_dir:
+        raise HTTPException(status_code=409, detail="downstream output is not ready")
+
+    base_dir = Path(st.downstream_dir).resolve()
+    ref_path = Path(ref).resolve()
+    mobile_path = Path(mobile).resolve()
+    for path in (ref_path, mobile_path):
+        if path.suffix.lower() != ".pdb" or not path.is_file() or base_dir not in path.parents:
+            raise HTTPException(status_code=404, detail=f"compare pdb not found: {path}")
+
+    ref_payload = _load_pdb_trace(ref_path)
+    mobile_payload = _load_pdb_trace(mobile_path)
+    ref_centroid, mobile_centroid, rotation, n = _kabsch_transform(
+        np.asarray(ref_payload["xyz"], dtype=np.float32),
+        np.asarray(mobile_payload["xyz"], dtype=np.float32),
+    )
+    try:
+        ref_text = ref_path.read_text(encoding="utf-8", errors="ignore")
+        mobile_text = _transform_pdb_text(mobile_path, ref_centroid, mobile_centroid, rotation)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"failed to build aligned pdb text: {e}")
+
+    return {
+        "ref_path": str(ref_path),
+        "mobile_path": str(mobile_path),
+        "ref_name": ref_path.name,
+        "mobile_name": mobile_path.name,
+        "length": int(n),
+        "ref_pdb": ref_text,
+        "mobile_pdb": mobile_text,
+    }

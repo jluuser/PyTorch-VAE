@@ -145,6 +145,12 @@
       background: #334155;
       box-shadow: none;
     }
+    button:disabled {
+      cursor: not-allowed;
+      opacity: 0.48;
+      box-shadow: none;
+      filter: grayscale(0.2);
+    }
     .hint, .status-meta, .viewer-help {
       color: var(--muted);
       font-size: 12px;
@@ -172,6 +178,7 @@
       gap: 16px;
     }
     .viewer-stage {
+      position: relative;
       background: linear-gradient(180deg, rgba(255,255,255,0.92), rgba(244,248,250,0.92));
       border: 1px solid var(--line);
       border-radius: 16px;
@@ -211,6 +218,49 @@
         radial-gradient(circle at 20% 10%, rgba(15, 118, 110, 0.08), transparent 35%),
         linear-gradient(180deg, #fcfefe, #eef4f5);
       border: 1px solid #dde6ea;
+    }
+    .mol-viewer {
+      position: relative;
+      width: 100%;
+      min-height: 460px;
+      border-radius: 14px;
+      overflow: hidden;
+      border: 1px solid #dde6ea;
+      background:
+        radial-gradient(circle at 20% 10%, rgba(15, 118, 110, 0.08), transparent 35%),
+        linear-gradient(180deg, #fcfefe, #eef4f5);
+    }
+    .mol-viewer.compare {
+      min-height: 420px;
+    }
+    .mol-viewer canvas {
+      display: block !important;
+      width: 100% !important;
+      height: 100% !important;
+    }
+    .hidden {
+      display: none !important;
+    }
+    .corner-legend {
+      position: absolute;
+      top: 14px;
+      right: 14px;
+      z-index: 3;
+      display: grid;
+      gap: 6px;
+      padding: 10px 12px;
+      border: 1px solid rgba(215, 225, 230, 0.95);
+      border-radius: 12px;
+      background: rgba(255, 255, 255, 0.92);
+      box-shadow: 0 12px 26px rgba(16, 35, 47, 0.08);
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .corner-legend .legend-row {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      white-space: nowrap;
     }
     .legend {
       display: flex;
@@ -549,7 +599,7 @@
 <div class="wrap">
   <div class="hero">
     <h1>ProtPainter 设计工作台</h1>
-    <p>这个页面现在承担整个项目的第一阶段入口。当前已经接通的是 `Curve` 生成、筛选和可视化；后续 `Sketch / Backbone / Sequence / Folded Structure / Evaluation` 先以工作台形式展示，方便你把整条设计链路放进同一个网页里。</p>
+    <p>从 curve 到 folded structure 的蛋白设计工作台。</p>
   </div>
 
   <div class="card" style="margin-bottom: 16px;">
@@ -558,32 +608,32 @@
       <div class="stage-card active" data-stage="curve">
         <div class="stage-kicker">Stage 1</div>
         <div class="stage-name">Curve</div>
-        <div class="stage-desc">AE + OT 生成曲线，做几何筛选，并从保留结果里挑选候选。</div>
+        <div class="stage-desc">生成、筛选并挑选曲线。</div>
       </div>
       <div class="stage-card pending" data-stage="sketch">
         <div class="stage-kicker">Stage 2</div>
         <div class="stage-name">Sketch</div>
-        <div class="stage-desc">把 curve 转成 sketch token / 结构草图，作为后续结构生成条件。</div>
+        <div class="stage-desc">curve 转 sketch。</div>
       </div>
       <div class="stage-card pending" data-stage="backbone">
         <div class="stage-kicker">Stage 3</div>
         <div class="stage-name">Backbone</div>
-        <div class="stage-desc">根据 sketch 生成 backbone / 结构候选，得到标准 PDB 级结果。</div>
+        <div class="stage-desc">生成 backbone 结构。</div>
       </div>
       <div class="stage-card pending" data-stage="sequence">
         <div class="stage-kicker">Stage 4</div>
         <div class="stage-name">Sequence</div>
-        <div class="stage-desc">基于 backbone 做序列设计，得到序列候选和设计分数。</div>
+        <div class="stage-desc">基于 backbone 设计序列。</div>
       </div>
       <div class="stage-card pending" data-stage="folded">
         <div class="stage-kicker">Stage 5</div>
         <div class="stage-name">Folded</div>
-        <div class="stage-desc">用 OmegaFold 等模型把设计序列折回三维结构，并为后续一致性指标提供输入。</div>
+        <div class="stage-desc">序列回折为三维结构。</div>
       </div>
       <div class="stage-card pending" data-stage="evaluation">
         <div class="stage-kicker">Stage 6</div>
         <div class="stage-name">Evaluation</div>
-        <div class="stage-desc">Sequence / Folded 完成后自动比较 curve / sketch / folded structure，做 RMSD、TM、pLDDT 等评估与选优。</div>
+        <div class="stage-desc">自动计算一致性指标。</div>
       </div>
     </div>
   </div>
@@ -621,7 +671,7 @@
         <button id="startBtn">提交生成任务</button>
         <button class="secondary" id="queryBtn">查询当前任务</button>
       </div>
-      <div class="hint">当前固定使用默认 AE checkpoint。`ot_bat_size_n` 主要影响 OT 分批和显存占用，通常应小于等于 `num_gen_x`。这块对应整个项目的 `Curve Stage`。</div>
+      <div class="hint">固定使用默认 AE checkpoint。`ot_bat_size_n` 主要影响 OT 分批和显存占用。</div>
     </div>
 
     <div class="main">
@@ -654,7 +704,7 @@
           <div class="card" style="padding: 14px;">
             <h2 style="margin-bottom: 10px;">曲线统计</h2>
             <div class="metric-grid" id="metricGrid"></div>
-            <div id="metricEmpty" class="empty" style="padding: 16px;">选择一条曲线后，这里会显示几何与二级结构统计。</div>
+            <div id="metricEmpty" class="empty" style="padding: 16px;">选择曲线后显示统计。</div>
           </div>
         </div>
       </div>
@@ -662,7 +712,7 @@
       <div class="card" style="padding: 14px;">
         <h2 style="margin-bottom: 10px;">筛选原因统计</h2>
         <div class="reason-list" id="reasonList"></div>
-        <div id="reasonEmpty" class="empty" style="padding: 16px;">任务完成后，这里会按 reject reason 统计被筛掉的曲线数量。</div>
+        <div id="reasonEmpty" class="empty" style="padding: 16px;">任务完成后显示 reject 统计。</div>
       </div>
 
       <div class="card">
@@ -670,7 +720,7 @@
           <div class="viewer-header">
             <div>
               <div class="viewer-title" id="viewerTitle">尚未选择曲线</div>
-              <div class="viewer-sub" id="viewerMeta">任务完成后会自动加载结果</div>
+              <div class="viewer-sub" id="viewerMeta">任务完成后自动加载</div>
             </div>
             <div class="status-badge queued" id="statusBadge">idle</div>
           </div>
@@ -680,20 +730,20 @@
             <span><i class="swatch" style="background: var(--sheet);"></i>Sheet</span>
             <span><i class="swatch" style="background: var(--loop);"></i>Loop</span>
           </div>
-          <div class="viewer-help">拖拽主画布可以旋转视角，滚轮可以缩放，双击画布会回到默认视角。</div>
+          <div class="viewer-help">拖拽旋转，滚轮缩放，双击复位。</div>
         </div>
       </div>
 
       <div class="card">
         <h2>保留结果</h2>
         <div id="gallery" class="curve-grid"></div>
-        <div id="emptyState" class="empty">提交任务后，这里会显示通过几何筛选的曲线预览，并支持把曲线加入下游流程候选池。</div>
+        <div id="emptyState" class="empty">任务完成后显示保留曲线。</div>
       </div>
 
       <div class="card">
         <h2>未通过筛选</h2>
         <div id="rejectedGallery" class="curve-grid"></div>
-        <div id="rejectedEmptyState" class="empty">这里会单独显示未通过几何筛选的曲线，并标注拒绝原因。</div>
+        <div id="rejectedEmptyState" class="empty">这里显示未通过筛选的曲线。</div>
       </div>
 
       <div class="card">
@@ -701,58 +751,77 @@
         <div class="downstream-shell">
           <div>
             <div class="row" style="margin-top: 0; margin-bottom: 12px;">
-              <button id="pushDownstreamBtn" class="secondary">准备进入下游流程</button>
               <button id="runDownstreamBtn">运行 Sketch / Backbone</button>
               <button id="runSequenceFoldBtn">运行 Sequence / Folded</button>
               <button id="clearSelectionBtn" class="secondary">清空已选曲线</button>
             </div>
-            <div class="hint" id="selectionHint" style="margin-bottom: 12px;">当前这部分先把选中的 curve 固化成任务级清单，保存到本次任务目录里，作为后续 `Sketch -> Backbone -> Sequence -> Folded -> Evaluation` 的标准入口。</div>
+            <div class="hint" id="selectionHint" style="margin-bottom: 12px;">选中 curve 后可直接运行 Sketch / Backbone，系统会自动保存下游清单。</div>
             <div id="selectionList" class="selection-list"></div>
-            <div id="selectionEmpty" class="empty">还没有选中任何 curve。你可以在“保留结果”里勾选想继续推进的曲线。</div>
+            <div id="selectionEmpty" class="empty">还没有选中任何 curve。</div>
             <div class="card" style="padding: 12px; margin-top: 12px;">
               <h2 style="margin-bottom: 8px;">下游状态</h2>
               <div class="status-meta" id="downstreamMeta">尚未启动下游流程</div>
               <div id="downstreamOutputList" class="selection-list" style="margin-top: 12px;"></div>
-              <div id="downstreamOutputEmpty" class="empty" style="padding: 16px; margin-top: 12px;">运行下游后，这里会显示 sketch 和 backbone 的输出路径。</div>
+              <div id="downstreamOutputEmpty" class="empty" style="padding: 16px; margin-top: 12px;">这里显示下游输出。</div>
               <div class="downstream-viewer-shell">
                 <div>
                   <div class="status-meta" style="margin-bottom: 10px;">PDB 结果列表</div>
                   <div id="downstreamPdbList" class="pdb-list"></div>
-                  <div id="downstreamPdbEmpty" class="empty" style="padding: 16px; margin-top: 10px;">下游完成后，这里会列出可视化的 Sketch / Backbone PDB。</div>
+                  <div id="downstreamPdbEmpty" class="empty" style="padding: 16px; margin-top: 10px;">这里显示可视化 PDB。</div>
                 </div>
                 <div class="viewer-stage">
                   <div class="viewer-header">
                     <div>
                       <div class="viewer-title" id="downstreamViewerTitle">尚未选择下游结构</div>
-                      <div class="viewer-sub" id="downstreamViewerMeta">运行下游后，这里会显示 Sketch PDB 或 Backbone PDB 的 3D 预览。</div>
+                      <div class="viewer-sub" id="downstreamViewerMeta">选择结果后显示 3D 预览。</div>
                     </div>
                   </div>
-                  <canvas id="downstreamCanvas" width="760" height="460"></canvas>
-                  <div class="viewer-help">拖拽可以旋转，滚轮可以缩放，双击恢复默认视角。</div>
+                  <div class="corner-legend">
+                    <div class="legend-row"><i class="swatch" style="background: var(--helix);"></i>Helix</div>
+                    <div class="legend-row"><i class="swatch" style="background: var(--sheet);"></i>Sheet</div>
+                    <div class="legend-row"><i class="swatch" style="background: var(--loop);"></i>Loop</div>
+                  </div>
+                  <div id="downstreamViewer3d" class="mol-viewer"></div>
+                  <canvas id="downstreamSketchCanvas" class="hidden" width="760" height="460"></canvas>
+                  <div class="viewer-help">拖拽旋转，滚轮缩放，双击复位。</div>
                 </div>
               </div>
               <div class="viewer-stage" style="margin-top: 14px;">
                 <div class="viewer-header">
                   <div>
-                    <div class="viewer-title" id="compareViewerTitle">Backbone / Folded 对比</div>
-                    <div class="viewer-sub" id="compareViewerMeta">选择 folded 结果后，这里会叠加显示 backbone 和 folded，方便直接比较。</div>
+                    <div class="viewer-title" id="sketchCompareViewerTitle">Sketch / Backbone 对比</div>
+                    <div class="viewer-sub" id="sketchCompareViewerMeta">运行 Sketch / Backbone 后显示两者对比。</div>
                   </div>
                 </div>
-                <canvas id="compareCanvas" width="760" height="420"></canvas>
+                <canvas id="sketchCompareCanvas" width="760" height="420"></canvas>
                 <div class="legend">
-                  <span><i class="swatch" style="background: #f97316;"></i>Backbone</span>
-                  <span><i class="swatch" style="background: #0f766e;"></i>Folded</span>
+                  <span id="sketchCompareLegendA"><i class="swatch" style="background: #f97316;"></i>Sketch</span>
+                  <span id="sketchCompareLegendB"><i class="swatch" style="background: #0f766e;"></i>Backbone</span>
                 </div>
+              </div>
+              <div class="viewer-stage" style="margin-top: 14px;">
+                <div class="viewer-header">
+                  <div>
+                    <div class="viewer-title" id="foldedCompareViewerTitle">Backbone / Folded 对比</div>
+                    <div class="viewer-sub" id="foldedCompareViewerMeta">运行 Sequence / Folded 后显示闭环对比。</div>
+                  </div>
+                </div>
+                <div id="foldedCompareViewer3d" class="mol-viewer"></div>
+                <div class="legend">
+                  <span id="foldedCompareLegendA"><i class="swatch" style="background: #f97316;"></i>Backbone</span>
+                  <span id="foldedCompareLegendB"><i class="swatch" style="background: #0f766e;"></i>Folded</span>
+                </div>
+                <div class="viewer-help">PyMOL 风格叠加显示，统一视角用于直接对比。</div>
               </div>
               <div class="card" style="padding: 12px; margin-top: 12px;">
                 <h2 style="margin-bottom: 8px;">Sequence 输出</h2>
                 <div id="sequenceOutputList" class="selection-list"></div>
-                <div id="sequenceOutputEmpty" class="empty" style="padding: 16px; margin-top: 12px;">运行 Sequence / Folded 后，这里会显示每个 backbone 对应的 FASTA 和序列列表。</div>
+                <div id="sequenceOutputEmpty" class="empty" style="padding: 16px; margin-top: 12px;">这里显示 FASTA 和序列。</div>
               </div>
               <div class="card" style="padding: 12px; margin-top: 12px;">
                 <h2 style="margin-bottom: 8px;">Evaluation 输出</h2>
                 <div id="evaluationOutputList" class="selection-list"></div>
-                <div id="evaluationOutputEmpty" class="empty" style="padding: 16px; margin-top: 12px;">Sequence / Folded 完成后，这里会自动显示 RMSD、TM、pLDDT、curve similarity、ssAcc 等指标。</div>
+                <div id="evaluationOutputEmpty" class="empty" style="padding: 16px; margin-top: 12px;">这里显示自动评估指标。</div>
               </div>
             </div>
           </div>
@@ -760,32 +829,27 @@
             <div class="downstream-card">
               <div class="downstream-title">Sketch Stage</div>
               <div class="downstream-state" id="stageStateSketch">Planned</div>
-              <div class="downstream-copy">选中的 curve 会先进入 curve2sketch，生成 `*_sketch.npy` 和 sketch 级中间表示。</div>
+              <div class="downstream-copy">curve2sketch 生成 `*_sketch.npy`。</div>
             </div>
             <div class="downstream-card">
               <div class="downstream-title">Backbone Stage</div>
               <div class="downstream-state" id="stageStateBackbone">Planned</div>
-              <div class="downstream-copy">Sketch 会进一步进入 PFF 条件生成，得到 backbone / `sample.pdb` 等结构候选。</div>
+              <div class="downstream-copy">PFF 生成 backbone / `sample.pdb`。</div>
             </div>
             <div class="downstream-card">
               <div class="downstream-title">Sequence Stage</div>
               <div class="downstream-state" id="stageStateSequence">Planned</div>
-              <div class="downstream-copy">Backbone 会作为 LMPNN 输入，设计对应序列并输出 FASTA 与序列评分。</div>
+              <div class="downstream-copy">LMPNN 设计序列并输出 FASTA。</div>
             </div>
             <div class="downstream-card">
               <div class="downstream-title">Folded Stage</div>
               <div class="downstream-state" id="stageStateFolded">Planned</div>
-      <div class="downstream-copy">设计出的序列会再进入 OmegaFold，回折成三维结构，并自动附带闭环验证指标。</div>
+      <div class="downstream-copy">OmegaFold 回折，并自动附带指标。</div>
             </div>
             <div class="downstream-card">
               <div class="downstream-title">Evaluation Stage</div>
               <div class="downstream-state" id="stageStateEvaluation">Planned</div>
-      <div class="downstream-copy">Folded 完成后会自动计算 RMSD、TM、pLDDT、curve similarity、ssACC 等指标，不再单独触发一步。</div>
-            </div>
-            <div class="downstream-card">
-              <div class="downstream-title">Current Scope</div>
-              <div class="downstream-state" id="stageStateScope">Sketch/Backbone Ready</div>
-              <div class="downstream-copy">目前网页真正接通的是 `Curve Stage`。这块先把项目全貌和样本选择流程放到前台，方便下一步接后端。</div>
+      <div class="downstream-copy">自动计算 RMSD、TM、pLDDT、curve similarity、ssAcc。</div>
             </div>
           </div>
         </div>
@@ -794,6 +858,7 @@
   </div>
 </div>
 
+<script src="https://3Dmol.org/build/3Dmol-min.js"></script>
 <script>
   const SS_COLORS = ['#dc2626', '#16a34a', '#2563eb'];
 
@@ -814,10 +879,18 @@
   const sequenceOutputEmpty = document.getElementById('sequenceOutputEmpty');
   const evaluationOutputList = document.getElementById('evaluationOutputList');
   const evaluationOutputEmpty = document.getElementById('evaluationOutputEmpty');
+  const runDownstreamBtn = document.getElementById('runDownstreamBtn');
+  const runSequenceFoldBtn = document.getElementById('runSequenceFoldBtn');
   const downstreamViewerTitle = document.getElementById('downstreamViewerTitle');
   const downstreamViewerMeta = document.getElementById('downstreamViewerMeta');
-  const compareViewerTitle = document.getElementById('compareViewerTitle');
-  const compareViewerMeta = document.getElementById('compareViewerMeta');
+  const sketchCompareViewerTitle = document.getElementById('sketchCompareViewerTitle');
+  const sketchCompareViewerMeta = document.getElementById('sketchCompareViewerMeta');
+  const sketchCompareLegendA = document.getElementById('sketchCompareLegendA');
+  const sketchCompareLegendB = document.getElementById('sketchCompareLegendB');
+  const foldedCompareViewerTitle = document.getElementById('foldedCompareViewerTitle');
+  const foldedCompareViewerMeta = document.getElementById('foldedCompareViewerMeta');
+  const foldedCompareLegendA = document.getElementById('foldedCompareLegendA');
+  const foldedCompareLegendB = document.getElementById('foldedCompareLegendB');
   const stageStateSketch = document.getElementById('stageStateSketch');
   const stageStateBackbone = document.getElementById('stageStateBackbone');
   const stageStateSequence = document.getElementById('stageStateSequence');
@@ -838,8 +911,10 @@
   const statTime = document.getElementById('statTime');
 
   const mainCanvas = document.getElementById('mainCanvas');
-  const downstreamCanvas = document.getElementById('downstreamCanvas');
-  const compareCanvas = document.getElementById('compareCanvas');
+  const downstreamViewer3d = document.getElementById('downstreamViewer3d');
+  const downstreamSketchCanvas = document.getElementById('downstreamSketchCanvas');
+  const sketchCompareCanvas = document.getElementById('sketchCompareCanvas');
+  const foldedCompareViewer3d = document.getElementById('foldedCompareViewer3d');
 
   let currentTaskId = '';
   let currentCurves = [];
@@ -852,17 +927,20 @@
   const DEFAULT_YAW = -0.85;
   const DEFAULT_PITCH = 0.55;
   let rotationMatrix = null;
-  let downstreamRotationMatrix = null;
   let zoom = 1.0;
-  let downstreamZoom = 1.0;
   let dragState = null;
-  let downstreamDragState = null;
+  let sketchRotationMatrix = null;
+  let sketchZoom = 1.0;
+  let sketchDragState = null;
+  let selectedSketchTrace = null;
   let downstreamPdbItems = [];
   let selectedDownstreamPdbPath = '';
+  let currentDownstreamSummary = null;
   let downstreamPdbCache = new Map();
-  let compareRotationMatrix = null;
-  let compareZoom = 1.0;
-  let compareDragState = null;
+  let downstreamPdbTextCache = new Map();
+  let downstreamMolViewer = null;
+  let foldedCompareMolViewer = null;
+  const sketchCompareState = { rotationMatrix: null, zoom: 1.0, dragState: null, payload: null };
 
   function setSelectionHint(message) {
     selectionHint.textContent = message;
@@ -880,6 +958,22 @@
       el.style.background = 'rgba(220, 38, 38, 0.12)';
       el.style.color = '#b91c1c';
     }
+  }
+
+  function updateDownstreamButtons(data) {
+    const status = data?.status || 'idle';
+    const action = data?.action || 'backbone';
+    const busy = status === 'queued' || status === 'running';
+
+    runDownstreamBtn.disabled = busy;
+    runSequenceFoldBtn.disabled = busy;
+
+    runDownstreamBtn.textContent = busy && action === 'backbone'
+      ? 'Sketch / Backbone 运行中...'
+      : '运行 Sketch / Backbone';
+    runSequenceFoldBtn.textContent = busy && action === 'sequence_fold'
+      ? 'Sequence / Folded 运行中...'
+      : '运行 Sequence / Folded';
   }
 
   function renderDownstreamOutputs(summary) {
@@ -962,33 +1056,309 @@
     return data;
   }
 
+  async function loadDownstreamPdbText(path) {
+    if (downstreamPdbTextCache.has(path)) {
+      return downstreamPdbTextCache.get(path);
+    }
+    const res = await fetch(`/tasks/${currentTaskId}/downstream-pdb-text?path=${encodeURIComponent(path)}`);
+    const text = await res.text();
+    if (!res.ok) throw new Error(text || 'failed to load pdb text');
+    downstreamPdbTextCache.set(path, text);
+    return text;
+  }
+
+  async function loadDownstreamCompare(refPath, mobilePath) {
+    const res = await fetch(`/tasks/${currentTaskId}/downstream-compare?ref=${encodeURIComponent(refPath)}&mobile=${encodeURIComponent(mobilePath)}`);
+    const data = await res.json();
+    if (!res.ok) throw new Error(JSON.stringify(data));
+    return data;
+  }
+
+  async function loadDownstreamComparePdbText(refPath, mobilePath) {
+    const res = await fetch(`/tasks/${currentTaskId}/downstream-compare-pdb-text?ref=${encodeURIComponent(refPath)}&mobile=${encodeURIComponent(mobilePath)}`);
+    const data = await res.json();
+    if (!res.ok) throw new Error(JSON.stringify(data));
+    return data;
+  }
+
+  function ensureMolViewer(target, background = 'white') {
+    if (typeof window.$3Dmol === 'undefined') {
+      throw new Error('3Dmol.js 未加载成功');
+    }
+    return window.$3Dmol.createViewer(target, { backgroundColor: background });
+  }
+
+  function showSketchFallback(show) {
+    downstreamViewer3d.classList.toggle('hidden', show);
+    downstreamSketchCanvas.classList.toggle('hidden', !show);
+  }
+
+  function ssColorForAtom(atom) {
+    const ss = String(atom?.ss || atom?.sslabel || '').toLowerCase();
+    if (ss.startsWith('h')) return '#dc2626';
+    if (ss.startsWith('s') || ss.startsWith('e')) return '#16a34a';
+    return '#2563eb';
+  }
+
+  function residueKeysFromPdbInfo(pdbInfo) {
+    return (pdbInfo?.residue_id || []).map(v => {
+      const n = Number.parseInt(String(v).trim(), 10);
+      return Number.isFinite(n) ? n : String(v).trim();
+    });
+  }
+
+  function ssColorByIdx(idx) {
+    if (idx === 0) return '#dc2626';
+    if (idx === 1) return '#16a34a';
+    return '#2563eb';
+  }
+
+  function isCaOnlyPdbText(pdbText) {
+    const atomLines = pdbText.split('\n').filter(line => line.startsWith('ATOM') || line.startsWith('HETATM'));
+    if (!atomLines.length) return false;
+    return atomLines.every(line => line.slice(12, 16).trim() === 'CA');
+  }
+
+  function applySsStyles(viewer, pdbInfo, pdbText, opacity = 1.0, modelIndex = null) {
+    const residueKeys = residueKeysFromPdbInfo(pdbInfo);
+    const ssIdx = pdbInfo?.ss_idx || [];
+    const caOnly = isCaOnlyPdbText(pdbText);
+    for (let i = 0; i < residueKeys.length; i++) {
+      const resi = residueKeys[i];
+      const color = ssColorByIdx(ssIdx[i] ?? 2);
+      const selection = modelIndex === null ? { resi } : { model: modelIndex, resi };
+      if (caOnly) {
+        viewer.setStyle(selection, {
+          sphere: { color, radius: 0.42, opacity },
+          line: { color, linewidth: 2.0, opacity },
+        });
+      } else {
+        viewer.setStyle(selection, {
+          cartoon: { color, opacity, thickness: 0.35, style: 'oval' },
+        });
+      }
+    }
+  }
+
+  function drawOverlayCurve(canvas, payload, rotationOverride = null, zoomOverride = null) {
+    const ctx = canvas.getContext('2d');
+    const width = canvas.width;
+    const height = canvas.height;
+    ctx.clearRect(0, 0, width, height);
+    const grd = ctx.createLinearGradient(0, 0, 0, height);
+    grd.addColorStop(0, '#fbfefd');
+    grd.addColorStop(1, '#edf3f5');
+    ctx.fillStyle = grd;
+    ctx.fillRect(0, 0, width, height);
+
+    if (!payload || !payload.ref_xyz?.length || !payload.mobile_xyz?.length) {
+      ctx.fillStyle = '#6b7f8e';
+      ctx.font = '18px IBM Plex Sans, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('暂无对比可视化', width / 2, height / 2);
+      return;
+    }
+
+    const activeRotation = rotationOverride || buildDefaultRotationMatrix();
+    const activeZoom = zoomOverride ?? 1.0;
+    const allPts = [...payload.ref_xyz, ...payload.mobile_xyz];
+    const projected = project3DWithState(allPts, width, height, activeRotation, activeZoom);
+    const refPts = projected.slice(0, payload.ref_xyz.length);
+    const mobPts = projected.slice(payload.ref_xyz.length);
+
+    const drawTrace = (pts, color) => {
+      ctx.lineWidth = 3;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      for (let i = 0; i < pts.length - 1; i++) {
+        const p1 = pts[i];
+        const p2 = pts[i + 1];
+        ctx.strokeStyle = color;
+        ctx.beginPath();
+        ctx.moveTo(p1.x, p1.y);
+        ctx.lineTo(p2.x, p2.y);
+        ctx.stroke();
+      }
+    };
+    drawTrace(refPts, '#f97316');
+    drawTrace(mobPts, '#0f766e');
+  }
+
+  function setComparePanelEmpty(kind, title, subtitle, legendA, legendB) {
+    const mapping = kind === 'sketch_backbone'
+      ? {
+          canvas: sketchCompareCanvas,
+          state: sketchCompareState,
+          titleEl: sketchCompareViewerTitle,
+          metaEl: sketchCompareViewerMeta,
+          legendAEl: sketchCompareLegendA,
+          legendBEl: sketchCompareLegendB,
+        }
+      : {
+          canvas: null,
+          state: null,
+          titleEl: foldedCompareViewerTitle,
+          metaEl: foldedCompareViewerMeta,
+          legendAEl: foldedCompareLegendA,
+          legendBEl: foldedCompareLegendB,
+        };
+    if (kind === 'sketch_backbone') {
+      mapping.state.payload = null;
+      drawOverlayCurve(mapping.canvas, null);
+    } else if (foldedCompareMolViewer) {
+      foldedCompareMolViewer.clear();
+      foldedCompareMolViewer.render();
+    }
+    mapping.titleEl.textContent = title;
+    mapping.metaEl.textContent = subtitle;
+    mapping.legendAEl.innerHTML = `<i class="swatch" style="background: #f97316;"></i>${legendA}`;
+    mapping.legendBEl.innerHTML = `<i class="swatch" style="background: #0f766e;"></i>${legendB}`;
+  }
+
+  async function renderSingleMol(path) {
+    const [pdbInfo, pdbText] = await Promise.all([
+      loadDownstreamPdb(path),
+      loadDownstreamPdbText(path),
+    ]);
+    if (isCaOnlyPdbText(pdbText)) {
+      showSketchFallback(true);
+      const trace = {
+        name: pdbInfo.name,
+        xyz: pdbInfo.xyz,
+        ss_idx: pdbInfo.ss_idx || Array((pdbInfo.xyz || []).length).fill(2),
+      };
+      selectedSketchTrace = trace;
+      drawCurve(downstreamSketchCanvas, trace, false, sketchRotationMatrix, sketchZoom);
+      return;
+    }
+    showSketchFallback(false);
+    selectedSketchTrace = null;
+    if (!downstreamMolViewer) {
+      downstreamMolViewer = ensureMolViewer(downstreamViewer3d, 'white');
+    }
+    downstreamMolViewer.clear();
+    downstreamMolViewer.addModel(pdbText, 'pdb');
+    applySsStyles(downstreamMolViewer, pdbInfo, pdbText, 1.0, 0);
+    downstreamMolViewer.resize();
+    downstreamMolViewer.center();
+    downstreamMolViewer.zoomTo();
+    downstreamMolViewer.render();
+    requestAnimationFrame(() => {
+      downstreamMolViewer.resize();
+      downstreamMolViewer.zoomTo();
+      downstreamMolViewer.render();
+    });
+  }
+
+  async function renderCompareMol(kind, refPath, mobilePath, title, subtitle, legendA, legendB) {
+    if (kind === 'backbone_folded') {
+      if (!refPath || !mobilePath) {
+        setComparePanelEmpty('backbone_folded', title, subtitle, legendA, legendB);
+        return;
+      }
+      const payload = await loadDownstreamComparePdbText(refPath, mobilePath);
+      if (!foldedCompareMolViewer) {
+        foldedCompareMolViewer = ensureMolViewer(foldedCompareViewer3d, 'white');
+      }
+      foldedCompareMolViewer.clear();
+      foldedCompareMolViewer.addModel(payload.ref_pdb, 'pdb');
+      foldedCompareMolViewer.addModel(payload.mobile_pdb, 'pdb');
+      foldedCompareMolViewer.setStyle({ model: 0 }, {
+        cartoon: { color: '#f97316', opacity: 0.72, thickness: 0.32, style: 'oval' },
+      });
+      foldedCompareMolViewer.setStyle({ model: 1 }, {
+        cartoon: { color: '#0f766e', opacity: 0.88, thickness: 0.32, style: 'oval' },
+      });
+      foldedCompareMolViewer.resize();
+      foldedCompareMolViewer.zoomTo();
+      foldedCompareMolViewer.render();
+      requestAnimationFrame(() => {
+        foldedCompareMolViewer.resize();
+        foldedCompareMolViewer.zoomTo();
+        foldedCompareMolViewer.render();
+      });
+      foldedCompareViewerTitle.textContent = title;
+      foldedCompareViewerMeta.textContent = subtitle;
+      foldedCompareLegendA.innerHTML = `<i class="swatch" style="background: #f97316;"></i>${legendA}`;
+      foldedCompareLegendB.innerHTML = `<i class="swatch" style="background: #0f766e;"></i>${legendB}`;
+      return;
+    }
+
+    const mapping = kind === 'sketch_backbone'
+      ? {
+          canvas: sketchCompareCanvas,
+          state: sketchCompareState,
+          titleEl: sketchCompareViewerTitle,
+          metaEl: sketchCompareViewerMeta,
+          legendAEl: sketchCompareLegendA,
+          legendBEl: sketchCompareLegendB,
+        }
+      : null;
+    if (!refPath || !mobilePath) {
+      mapping.state.payload = null;
+      drawOverlayCurve(mapping.canvas, null);
+      mapping.titleEl.textContent = title;
+      mapping.metaEl.textContent = subtitle;
+      mapping.legendAEl.innerHTML = `<i class="swatch" style="background: #f97316;"></i>${legendA}`;
+      mapping.legendBEl.innerHTML = `<i class="swatch" style="background: #0f766e;"></i>${legendB}`;
+      return;
+    }
+    mapping.state.payload = await loadDownstreamCompare(refPath, mobilePath);
+    drawOverlayCurve(mapping.canvas, mapping.state.payload, mapping.state.rotationMatrix, mapping.state.zoom);
+    mapping.titleEl.textContent = title;
+    mapping.metaEl.textContent = subtitle;
+    mapping.legendAEl.innerHTML = `<i class="swatch" style="background: #f97316;"></i>${legendA}`;
+    mapping.legendBEl.innerHTML = `<i class="swatch" style="background: #0f766e;"></i>${legendB}`;
+  }
+
+  async function renderComparePanelsForItem(item) {
+    const backbones = currentDownstreamSummary?.backbones || [];
+    const target = backbones.find(entry => entry.name === item?.name) || backbones[0];
+    if (!target) {
+      setComparePanelEmpty('sketch_backbone', 'Sketch / Backbone 对比', '运行 Sketch / Backbone 后显示两者对比。', 'Sketch', 'Backbone');
+      setComparePanelEmpty('backbone_folded', 'Backbone / Folded 对比', '运行 Sequence / Folded 后显示闭环对比。', 'Backbone', 'Folded');
+      return;
+    }
+
+    const sketchPath = target.sketch_pdb || '';
+    const samplePath = item?.kind === 'Backbone PDB' ? item.path : (target.sample_pdbs?.[0] || '');
+    const foldedPath = item?.kind === 'Folded PDB' ? item.path : (target.folded_pdbs?.[0] || '');
+
+    await renderCompareMol(
+      'sketch_backbone',
+      sketchPath,
+      samplePath,
+      `${target.name} | Sketch / Backbone`,
+      `${PathSafe(sketchPath)} vs ${PathSafe(samplePath)}`,
+      'Sketch',
+      'Backbone',
+    );
+    await renderCompareMol(
+      'backbone_folded',
+      samplePath,
+      foldedPath,
+      `${target.name} | Backbone / Folded`,
+      `${PathSafe(samplePath)} vs ${PathSafe(foldedPath)}`,
+      'Backbone',
+      'Folded',
+    );
+  }
+
   async function selectDownstreamPdb(path) {
     selectedDownstreamPdbPath = path;
     const pdb = await loadDownstreamPdb(path);
-    const trace = {
-      name: pdb.name,
-      xyz: pdb.xyz,
-      ss_idx: pdb.ss_idx || Array((pdb.xyz || []).length).fill(2),
-      metrics: {},
-      length: pdb.length,
-    };
-    drawCurve(downstreamCanvas, trace, false, true);
+    await renderSingleMol(path);
     downstreamViewerTitle.textContent = pdb.name;
     downstreamViewerMeta.textContent = `${pdb.path} | CA trace length ${pdb.length}`;
     Array.from(downstreamPdbList.children).forEach(card => {
       card.classList.toggle('active', card.dataset.path === path);
     });
     const activeItem = downstreamPdbItems.find(item => item.path === path);
-    if (activeItem?.kind === 'Folded PDB' && activeItem.comparePath) {
-      await renderCompareOverlay(activeItem.comparePath, activeItem.path, `${activeItem.name} | Backbone vs Folded`);
-    } else {
-      drawCurve(compareCanvas, null, false, true);
-      compareViewerTitle.textContent = 'Backbone / Folded 对比';
-      compareViewerMeta.textContent = '选择 folded 结果后，这里会叠加显示 backbone 和 folded，方便直接比较。';
-    }
+    await renderComparePanelsForItem(activeItem || null);
   }
 
   function renderDownstreamPdbItems(summary) {
+    currentDownstreamSummary = summary || null;
     downstreamPdbList.innerHTML = '';
     downstreamPdbItems = [];
     const backbones = summary?.backbones || [];
@@ -999,6 +1369,7 @@
           kind: 'Sketch PDB',
           name: item.name,
           comparePath: item.sample_pdbs?.[0] || '',
+          compareMode: 'sketch_backbone',
         });
       }
       for (const samplePath of (item.sample_pdbs || [])) {
@@ -1006,7 +1377,8 @@
           path: samplePath,
           kind: 'Backbone PDB',
           name: item.name,
-          comparePath: '',
+          comparePath: item.sketch_pdb || '',
+          compareMode: 'sketch_backbone',
         });
       }
       for (const foldedPath of (item.folded_pdbs || [])) {
@@ -1015,6 +1387,7 @@
           kind: 'Folded PDB',
           name: item.name,
           comparePath: item.sample_pdbs?.[0] || '',
+          compareMode: 'backbone_folded',
         });
       }
     }
@@ -1022,11 +1395,14 @@
     if (!downstreamPdbItems.length) {
       downstreamPdbEmpty.style.display = 'block';
       downstreamViewerTitle.textContent = '尚未选择下游结构';
-      downstreamViewerMeta.textContent = '运行下游后，这里会显示 Sketch PDB 或 Backbone PDB 的 3D 预览。';
-      drawCurve(downstreamCanvas, null, false, true);
-      drawCurve(compareCanvas, null, false, true);
-      compareViewerTitle.textContent = 'Backbone / Folded 对比';
-      compareViewerMeta.textContent = '选择 folded 结果后，这里会叠加显示 backbone 和 folded，方便直接比较。';
+      downstreamViewerMeta.textContent = '选择结果后显示 3D 预览。';
+      showSketchFallback(false);
+      if (downstreamMolViewer) {
+        downstreamMolViewer.clear();
+        downstreamMolViewer.render();
+      }
+      setComparePanelEmpty('sketch_backbone', 'Sketch / Backbone 对比', '运行 Sketch / Backbone 后显示两者对比。', 'Sketch', 'Backbone');
+      setComparePanelEmpty('backbone_folded', 'Backbone / Folded 对比', '运行 Sequence / Folded 后显示闭环对比。', 'Backbone', 'Folded');
       return;
     }
 
@@ -1056,55 +1432,13 @@
     });
   }
 
-  async function renderCompareOverlay(backbonePath, foldedPath, label) {
-    if (!backbonePath || !foldedPath) {
-      drawCurve(compareCanvas, null, false, true);
-      compareViewerTitle.textContent = 'Backbone / Folded 对比';
-      compareViewerMeta.textContent = '选择 folded 结果后，这里会叠加显示 backbone 和 folded，方便直接比较。';
-      return;
-    }
-    const [backbone, folded] = await Promise.all([loadDownstreamPdb(backbonePath), loadDownstreamPdb(foldedPath)]);
-    const ctx = compareCanvas.getContext('2d');
-    const width = compareCanvas.width;
-    const height = compareCanvas.height;
-    ctx.clearRect(0, 0, width, height);
-    const grd = ctx.createLinearGradient(0, 0, 0, height);
-    grd.addColorStop(0, '#fbfefd');
-    grd.addColorStop(1, '#edf3f5');
-    ctx.fillStyle = grd;
-    ctx.fillRect(0, 0, width, height);
-    const activeRotation = compareRotationMatrix || buildDefaultRotationMatrix();
-    const activeZoom = compareZoom;
-    const combined = [...backbone.xyz, ...folded.xyz];
-    const projected = project3DWithState(combined, width, height, activeRotation, activeZoom);
-    const backbonePts = projected.slice(0, backbone.xyz.length);
-    const foldedPts = projected.slice(backbone.xyz.length);
-    const drawTrace = (pts, color) => {
-      ctx.lineWidth = 3;
-      ctx.lineCap = 'round';
-      ctx.lineJoin = 'round';
-      for (let i = 0; i < pts.length - 1; i++) {
-        const p1 = pts[i];
-        const p2 = pts[i + 1];
-        ctx.strokeStyle = color;
-        ctx.beginPath();
-        ctx.moveTo(p1.x, p1.y);
-        ctx.lineTo(p2.x, p2.y);
-        ctx.stroke();
-      }
-    };
-    drawTrace(backbonePts, '#f97316');
-    drawTrace(foldedPts, '#0f766e');
-    compareViewerTitle.textContent = label || 'Backbone / Folded 对比';
-    compareViewerMeta.textContent = `${PathSafe(backbonePath)} vs ${PathSafe(foldedPath)}`;
-  }
-
   function renderDownstreamStatus(data) {
     const summary = data?.summary || null;
     const stages = summary?.stages || {};
     const phase = data?.action || 'backbone';
     const running = data?.status === 'running' || data?.status === 'queued';
     const phaseLabel = phase === 'sequence_fold' ? 'Sequence / Folded' : phase === 'evaluation' ? 'Evaluation' : 'Sketch / Backbone';
+    updateDownstreamButtons(data);
     setDownstreamState(stageStateSketch, stages.sketch?.status === 'done' ? 'Done' : (running && phase === 'backbone') ? 'Queued/Running' : 'Planned');
     setDownstreamState(stageStateBackbone, stages.backbone?.status === 'done' ? 'Done' : (running && phase === 'backbone') ? 'Queued/Running' : 'Planned');
     setDownstreamState(stageStateSequence, stages.sequence?.status === 'done' ? 'Done' : (running && phase === 'sequence_fold') ? 'Queued/Running' : 'Planned');
@@ -1290,7 +1624,9 @@
     currentCurves = [];
     currentRejectedCurves = [];
     selectedCurves = new Set();
+    currentDownstreamSummary = null;
     downstreamPdbCache = new Map();
+    downstreamPdbTextCache = new Map();
     downstreamPdbItems = [];
     selectedDownstreamPdbPath = '';
     selectedCurveName = '';
@@ -1307,6 +1643,14 @@
     reasonEmpty.style.display = 'block';
     renderSelectedCurves();
     renderDownstreamStatus({ status: 'idle' });
+    if (downstreamMolViewer) {
+      downstreamMolViewer.clear();
+      downstreamMolViewer.render();
+    }
+    selectedSketchTrace = null;
+    showSketchFallback(false);
+    setComparePanelEmpty('sketch_backbone', 'Sketch / Backbone 对比', '运行 Sketch / Backbone 后显示两者对比。', 'Sketch', 'Backbone');
+    setComparePanelEmpty('backbone_folded', 'Backbone / Folded 对比', '运行 Sequence / Folded 后显示闭环对比。', 'Backbone', 'Folded');
     rotationMatrix = buildDefaultRotationMatrix();
     zoom = 1.0;
     drawCurve(mainCanvas, null);
@@ -1321,11 +1665,11 @@
     const items = getSelectedCurveObjects();
     if (!items.length) {
       selectionEmpty.style.display = 'block';
-      setSelectionHint('当前这部分先把选中的 curve 固化成任务级清单，保存到本次任务目录里，作为后续 Sketch 到 Evaluation 的标准入口。');
+      setSelectionHint('选中 curve 后可直接运行 Sketch / Backbone，系统会自动保存下游清单。');
       return;
     }
     selectionEmpty.style.display = 'none';
-    setSelectionHint(`当前已选 ${items.length} 条 curve。点击“准备进入下游流程”后，会把这批 curve 写入本次任务目录下的 selected_curves/selected_manifest.json。`);
+    setSelectionHint(`当前已选 ${items.length} 条 curve。点击“运行 Sketch / Backbone”时，会自动把这批 curve 写入本次任务目录下的 selected_curves/selected_manifest.json。`);
     for (const curve of items) {
       const box = document.createElement('div');
       box.className = 'selection-item';
@@ -1361,7 +1705,7 @@
     renderSelectedCurves();
     renderGallery(gallery, emptyState, currentCurves, 'filtered');
     if ((data.selected_count || 0) > 0) {
-      setSelectionHint(`已保存 ${data.selected_count} 条 curve 到 ${data.selection_path}。后续可以直接把这份清单接到 ProtPainter 下游流程。`);
+      setSelectionHint(`已保存 ${data.selected_count} 条 curve 到 ${data.selection_path}。后续运行下游时会直接复用这份清单。`);
     }
   }
 
@@ -1395,7 +1739,7 @@
       return;
     }
     const data = await saveDownstreamSelectionByNames(selected.map(item => item.name));
-    setSelectionHint(`已保存 ${data.selected_count} 条 curve 到 ${data.selection_path}。这一步已经不再是前端占位，而是本次任务真实的 downstream selection manifest。`);
+    setSelectionHint(`已保存 ${data.selected_count} 条 curve 到 ${data.selection_path}。系统会直接用这份 manifest 启动下游。`);
   }
 
   function renderRejectCounts(rejectCounts) {
@@ -1457,7 +1801,7 @@
     }));
   }
 
-  function drawCurve(canvas, curve, small = false, isDownstream = false) {
+  function drawCurve(canvas, curve, small = false, rotationOverride = null, zoomOverride = null) {
     const ctx = canvas.getContext('2d');
     const width = canvas.width;
     const height = canvas.height;
@@ -1477,10 +1821,8 @@
       return;
     }
 
-    const activeRotation = isDownstream
-      ? (downstreamRotationMatrix || buildDefaultRotationMatrix())
-      : (rotationMatrix || buildDefaultRotationMatrix());
-    const activeZoom = isDownstream ? downstreamZoom : zoom;
+    const activeRotation = rotationOverride || rotationMatrix || buildDefaultRotationMatrix();
+    const activeZoom = zoomOverride ?? zoom;
     const pts = project3DWithState(curve.xyz, width, height, activeRotation, activeZoom);
 
     ctx.strokeStyle = 'rgba(16,35,47,0.08)';
@@ -1816,114 +2158,109 @@
     }
   }, { passive: false });
 
-  downstreamCanvas.addEventListener('pointerdown', (event) => {
-    downstreamDragState = {
-      startVec: canvasPointToArcballVec(downstreamCanvas, event.clientX, event.clientY),
-      startMatrix: downstreamRotationMatrix || buildDefaultRotationMatrix(),
+  downstreamSketchCanvas.addEventListener('pointerdown', (event) => {
+    sketchDragState = {
+      startVec: canvasPointToArcballVec(downstreamSketchCanvas, event.clientX, event.clientY),
+      startMatrix: sketchRotationMatrix || buildDefaultRotationMatrix(),
     };
-    downstreamCanvas.setPointerCapture(event.pointerId);
+    downstreamSketchCanvas.setPointerCapture(event.pointerId);
   });
 
-  downstreamCanvas.addEventListener('pointermove', (event) => {
-    if (!downstreamDragState || !selectedDownstreamPdbPath) return;
-    const curVec = canvasPointToArcballVec(downstreamCanvas, event.clientX, event.clientY);
-    const axis = cross3(downstreamDragState.startVec, curVec);
+  downstreamSketchCanvas.addEventListener('pointermove', (event) => {
+    if (!sketchDragState || !selectedSketchTrace) return;
+    const curVec = canvasPointToArcballVec(downstreamSketchCanvas, event.clientX, event.clientY);
+    const axis = cross3(sketchDragState.startVec, curVec);
     const axisNorm = norm3(axis);
     if (axisNorm < 1e-7) {
-      downstreamRotationMatrix = downstreamDragState.startMatrix;
+      sketchRotationMatrix = sketchDragState.startMatrix;
     } else {
-      const cosTheta = Math.max(-1, Math.min(1, dot3(downstreamDragState.startVec, curVec)));
+      const cosTheta = Math.max(-1, Math.min(1, dot3(sketchDragState.startVec, curVec)));
       const angle = Math.acos(cosTheta);
       const delta = axisAngleToMat(axis, angle);
-      downstreamRotationMatrix = matMul3(delta, downstreamDragState.startMatrix);
+      sketchRotationMatrix = matMul3(delta, sketchDragState.startMatrix);
     }
-    const active = downstreamPdbItems.find(item => item.path === selectedDownstreamPdbPath);
-    if (active) {
-      selectDownstreamPdb(active.path).catch(() => {});
-    }
+    drawCurve(downstreamSketchCanvas, selectedSketchTrace, false, sketchRotationMatrix, sketchZoom);
   });
 
-  function stopDownstreamDrag(event) {
-    if (!downstreamDragState) return;
-    downstreamDragState = null;
-    try { downstreamCanvas.releasePointerCapture(event.pointerId); } catch (_) {}
+  function stopSketchDrag(event) {
+    if (!sketchDragState) return;
+    sketchDragState = null;
+    try { downstreamSketchCanvas.releasePointerCapture(event.pointerId); } catch (_) {}
   }
 
-  downstreamCanvas.addEventListener('pointerup', stopDownstreamDrag);
-  downstreamCanvas.addEventListener('pointerleave', stopDownstreamDrag);
-  downstreamCanvas.addEventListener('dblclick', () => {
-    downstreamRotationMatrix = buildDefaultRotationMatrix();
-    downstreamZoom = 1.0;
-    const active = downstreamPdbItems.find(item => item.path === selectedDownstreamPdbPath);
-    if (active) selectDownstreamPdb(active.path).catch(() => {});
+  downstreamSketchCanvas.addEventListener('pointerup', stopSketchDrag);
+  downstreamSketchCanvas.addEventListener('pointerleave', stopSketchDrag);
+  downstreamSketchCanvas.addEventListener('dblclick', () => {
+    sketchRotationMatrix = buildDefaultRotationMatrix();
+    sketchZoom = 1.0;
+    if (selectedSketchTrace) {
+      drawCurve(downstreamSketchCanvas, selectedSketchTrace, false, sketchRotationMatrix, sketchZoom);
+    }
   });
 
-  downstreamCanvas.addEventListener('wheel', (event) => {
+  downstreamSketchCanvas.addEventListener('wheel', (event) => {
     event.preventDefault();
     const factor = event.deltaY < 0 ? 1.08 : 1 / 1.08;
-    downstreamZoom = Math.max(0.45, Math.min(4.0, downstreamZoom * factor));
-    const active = downstreamPdbItems.find(item => item.path === selectedDownstreamPdbPath);
-    if (active) {
-      selectDownstreamPdb(active.path).catch(() => {});
-    } else {
-      drawCurve(downstreamCanvas, null, false, true);
+    sketchZoom = Math.max(0.45, Math.min(4.0, sketchZoom * factor));
+    if (selectedSketchTrace) {
+      drawCurve(downstreamSketchCanvas, selectedSketchTrace, false, sketchRotationMatrix, sketchZoom);
     }
   }, { passive: false });
 
-  compareCanvas.addEventListener('pointerdown', (event) => {
-    compareDragState = {
-      startVec: canvasPointToArcballVec(compareCanvas, event.clientX, event.clientY),
-      startMatrix: compareRotationMatrix || buildDefaultRotationMatrix(),
-    };
-    compareCanvas.setPointerCapture(event.pointerId);
-  });
+  function bindCompareCanvas(canvas, state) {
+    canvas.addEventListener('pointerdown', (event) => {
+      state.dragState = {
+        startVec: canvasPointToArcballVec(canvas, event.clientX, event.clientY),
+        startMatrix: state.rotationMatrix || buildDefaultRotationMatrix(),
+      };
+      canvas.setPointerCapture(event.pointerId);
+    });
 
-  compareCanvas.addEventListener('pointermove', (event) => {
-    if (!compareDragState || !selectedDownstreamPdbPath) return;
-    const activeItem = downstreamPdbItems.find(item => item.path === selectedDownstreamPdbPath);
-    if (!activeItem?.comparePath || activeItem.kind !== 'Folded PDB') return;
-    const curVec = canvasPointToArcballVec(compareCanvas, event.clientX, event.clientY);
-    const axis = cross3(compareDragState.startVec, curVec);
-    const axisNorm = norm3(axis);
-    if (axisNorm < 1e-7) {
-      compareRotationMatrix = compareDragState.startMatrix;
-    } else {
-      const cosTheta = Math.max(-1, Math.min(1, dot3(compareDragState.startVec, curVec)));
-      const angle = Math.acos(cosTheta);
-      const delta = axisAngleToMat(axis, angle);
-      compareRotationMatrix = matMul3(delta, compareDragState.startMatrix);
+    canvas.addEventListener('pointermove', (event) => {
+      if (!state.dragState || !state.payload) return;
+      const curVec = canvasPointToArcballVec(canvas, event.clientX, event.clientY);
+      const axis = cross3(state.dragState.startVec, curVec);
+      const axisNorm = norm3(axis);
+      if (axisNorm < 1e-7) {
+        state.rotationMatrix = state.dragState.startMatrix;
+      } else {
+        const cosTheta = Math.max(-1, Math.min(1, dot3(state.dragState.startVec, curVec)));
+        const angle = Math.acos(cosTheta);
+        const delta = axisAngleToMat(axis, angle);
+        state.rotationMatrix = matMul3(delta, state.dragState.startMatrix);
+      }
+      drawOverlayCurve(canvas, state.payload, state.rotationMatrix, state.zoom);
+    });
+
+    function stopCompareDrag(event) {
+      if (!state.dragState) return;
+      state.dragState = null;
+      try { canvas.releasePointerCapture(event.pointerId); } catch (_) {}
     }
-    renderCompareOverlay(activeItem.comparePath, activeItem.path, `${activeItem.name} | Backbone vs Folded`).catch(() => {});
-  });
 
-  function stopCompareDrag(event) {
-    if (!compareDragState) return;
-    compareDragState = null;
-    try { compareCanvas.releasePointerCapture(event.pointerId); } catch (_) {}
+    canvas.addEventListener('pointerup', stopCompareDrag);
+    canvas.addEventListener('pointerleave', stopCompareDrag);
+    canvas.addEventListener('dblclick', () => {
+      state.rotationMatrix = buildDefaultRotationMatrix();
+      state.zoom = 1.0;
+      if (state.payload) {
+        drawOverlayCurve(canvas, state.payload, state.rotationMatrix, state.zoom);
+      } else {
+        drawOverlayCurve(canvas, null);
+      }
+    });
+
+    canvas.addEventListener('wheel', (event) => {
+      event.preventDefault();
+      const factor = event.deltaY < 0 ? 1.08 : 1 / 1.08;
+      state.zoom = Math.max(0.45, Math.min(4.0, state.zoom * factor));
+      if (state.payload) {
+        drawOverlayCurve(canvas, state.payload, state.rotationMatrix, state.zoom);
+      }
+    }, { passive: false });
   }
 
-  compareCanvas.addEventListener('pointerup', stopCompareDrag);
-  compareCanvas.addEventListener('pointerleave', stopCompareDrag);
-  compareCanvas.addEventListener('dblclick', () => {
-    compareRotationMatrix = buildDefaultRotationMatrix();
-    compareZoom = 1.0;
-    const activeItem = downstreamPdbItems.find(item => item.path === selectedDownstreamPdbPath);
-    if (activeItem?.comparePath && activeItem.kind === 'Folded PDB') {
-      renderCompareOverlay(activeItem.comparePath, activeItem.path, `${activeItem.name} | Backbone vs Folded`).catch(() => {});
-    }
-  });
-
-  compareCanvas.addEventListener('wheel', (event) => {
-    event.preventDefault();
-    const factor = event.deltaY < 0 ? 1.08 : 1 / 1.08;
-    compareZoom = Math.max(0.45, Math.min(4.0, compareZoom * factor));
-    const activeItem = downstreamPdbItems.find(item => item.path === selectedDownstreamPdbPath);
-    if (activeItem?.comparePath && activeItem.kind === 'Folded PDB') {
-      renderCompareOverlay(activeItem.comparePath, activeItem.path, `${activeItem.name} | Backbone vs Folded`).catch(() => {});
-    } else {
-      drawCurve(compareCanvas, null, false, true);
-    }
-  }, { passive: false });
+  bindCompareCanvas(sketchCompareCanvas, sketchCompareState);
 
   document.getElementById('startBtn').addEventListener('click', startTask);
   document.getElementById('queryBtn').addEventListener('click', queryTask);
@@ -1939,19 +2276,13 @@
       window.alert(`清空下游选择失败:\n${e}`);
     }
   });
-  document.getElementById('pushDownstreamBtn').addEventListener('click', async () => {
-    try {
-      await pushDownstreamSelection();
-    } catch (e) {
-      window.alert(`保存下游选择失败:\n${e}`);
-    }
-  });
-  document.getElementById('runDownstreamBtn').addEventListener('click', async () => {
+  runDownstreamBtn.addEventListener('click', async () => {
     if (!currentTaskId) {
       window.alert('请先完成一个 curve 任务。');
       return;
     }
     try {
+      updateDownstreamButtons({ status: 'queued', action: 'backbone' });
       await pushDownstreamSelection();
       const res = await fetch(`/tasks/${currentTaskId}/run-downstream`, { method: 'POST' });
       const data = await res.json();
@@ -1959,32 +2290,34 @@
       downstreamMeta.textContent = `下游任务已提交，当前队列长度 ${data.queue_size ?? '-'}，输出目录 ${data.output_dir || '-'}`;
       pollDownstream();
     } catch (e) {
+      updateDownstreamButtons({ status: 'idle' });
       window.alert(`启动下游流程失败:\n${e}`);
     }
   });
-  document.getElementById('runSequenceFoldBtn').addEventListener('click', async () => {
+  runSequenceFoldBtn.addEventListener('click', async () => {
     if (!currentTaskId) {
       window.alert('请先完成一个 curve 任务，并先跑通 Sketch / Backbone。');
       return;
     }
     try {
+      updateDownstreamButtons({ status: 'queued', action: 'sequence_fold' });
       const res = await fetch(`/tasks/${currentTaskId}/run-sequence-fold`, { method: 'POST' });
       const data = await res.json();
       if (!res.ok) throw new Error(JSON.stringify(data));
       downstreamMeta.textContent = `Sequence / Folded 已提交，当前队列长度 ${data.queue_size ?? '-'}，输出目录 ${data.output_dir || '-'}`;
       pollDownstream();
     } catch (e) {
+      updateDownstreamButtons({ status: 'idle' });
       window.alert(`启动 Sequence / Folded 失败:\n${e}`);
     }
   });
   rotationMatrix = buildDefaultRotationMatrix();
-  downstreamRotationMatrix = buildDefaultRotationMatrix();
-  compareRotationMatrix = buildDefaultRotationMatrix();
+  sketchRotationMatrix = buildDefaultRotationMatrix();
+  sketchCompareState.rotationMatrix = buildDefaultRotationMatrix();
   renderSelectedCurves();
   renderDownstreamStatus({ status: 'idle' });
   drawCurve(mainCanvas, null, false);
-  drawCurve(downstreamCanvas, null, false, true);
-  drawCurve(compareCanvas, null, false, true);
+  drawOverlayCurve(sketchCompareCanvas, null);
 </script>
 </body>
 </html>
